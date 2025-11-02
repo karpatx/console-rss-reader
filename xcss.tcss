@@ -1,0 +1,134 @@
+Screen {
+  background: $surface;
+  color: $text;
+  layout: vertical;
+}
+
+#header {
+  height: auto;
+  content-align: center middle;
+  background: $boost;
+  color: $text;
+  border: none;
+  padding: 1 2;
+}
+
+#main {
+  height: 1fr;
+  width: 1fr;
+  layout: horizontal;
+}
+
+#footer {
+  height: 1;
+  content-align: left middle;
+  padding: 0 1;
+  background: $panel;
+  color: $text;
+  border: none;
+}
+
+#sidebar {
+  width: 32;
+  min-width: 32;
+  padding: 1 1;
+  background: $panel;
+  border: solid $accent;
+  layout: vertical;
+}
+
+#sidebar SelectionList {
+  width: 1fr;
+  height: 1fr;
+  overflow: auto;
+  border: none;
+}
+
+#content {
+  width: 1fr;
+  height: 1fr;
+  layout: vertical;
+}
+
+#list {
+  height: 1fr;
+  overflow: auto;
+  padding: 0 1;
+  border: none;
+}
+
+#detail {
+  height: 1fr;
+  border: none;
+  border-top: solid $accent;
+}
+
+#detail:focus {
+  border-top: solid $warning;
+  border-left: thick $warning;
+  border-right: thick $warning;
+}
+
+#detail-content {
+  padding: 0 1;
+}
+
+/* Article modal screen styles */
+#article-container {
+  width: 90%;
+  height: 90%;
+  max-width: 120;
+  max-height: 50;
+  background: $surface;
+  border: solid $accent;
+  layout: vertical;
+  padding: 1;
+}
+
+#article-header {
+  height: auto;
+  content-align: left middle;
+  padding: 0 1;
+  border: none;
+  border-bottom: solid $accent;
+}
+
+#article-subheader {
+  height: auto;
+  content-align: left middle;
+  padding: 0 1;
+  border: none;
+}
+
+#article-body {
+  height: 1fr;
+  padding: 0 1;
+  border: none;
+}
+
+#article-text {
+  padding: 0 1;
+  text-align: left;
+}
+
+#article-footer {
+  height: auto;
+  width: 1fr;
+  border: none;
+  border-top: solid $accent;
+  padding: 1;
+  layout: horizontal;
+}
+
+#article-link {
+  content-align: left middle;
+  padding: 0 1;
+}
+
+ModalScreen #close-btn {
+  margin-left: 1;
+}
+
+ModalScreen {
+  align: center middle;
+}
