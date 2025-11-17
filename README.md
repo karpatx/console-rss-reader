@@ -6,7 +6,7 @@ RSS hírolvasó terminálalkalmazás Textual frameworkkel.
 
 - RSS feedek követése több forrásból
 - Cikkek listázása és előnézete
-- Teljes cikkek letöltése newspaper3k-val
+- Teljes cikkek letöltése newspaper4k-val
 - Billentyűalapú navigáció
 - Képek megjelenítése természetben
 

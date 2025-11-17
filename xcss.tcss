@@ -6,11 +6,28 @@ Screen {
 
 #header {
   height: auto;
-  content-align: center middle;
+  content-align: left middle;
   background: $boost;
   color: $text;
   border: none;
   padding: 1 2;
+  layout: horizontal;
+}
+
+#header-text {
+  width: 1fr;
+}
+
+#language-select {
+  width: 15;
+  min-width: 15;
+}
+
+#search-input {
+  height: 3;
+  padding: 0 1;
+  border: solid $accent;
+  background: $surface;
 }
 
 #main {
@@ -37,7 +54,7 @@ Screen {
   layout: vertical;
 }
 
-#sidebar SelectionList {
+#sidebar Tree {
   width: 1fr;
   height: 1fr;
   overflow: auto;
@@ -52,7 +69,7 @@ Screen {
 
 #list {
   height: 1fr;
-  overflow: auto;
+  overflow: hidden;
   padding: 0 1;
   border: none;
 }
@@ -91,6 +108,21 @@ Screen {
   padding: 0 1;
   border: none;
   border-bottom: solid $accent;
+  layout: horizontal;
+  align: left middle;
+}
+
+#article-title {
+  width: 1fr;
+  content-align: left middle;
+}
+
+#close-x-btn {
+  width: 3;
+  height: 3;
+  min-width: 3;
+  margin: 0;
+  padding: 0;
 }
 
 #article-subheader {
@@ -131,4 +163,25 @@ ModalScreen #close-btn {
 
 ModalScreen {
   align: center middle;
+}
+
+#article-container {
+  align: center middle;
+}
+
+/* Loading screen styles */
+#loading-container {
+  width: 40;
+  height: 10;
+  background: $surface;
+  border: solid $accent;
+  layout: vertical;
+  padding: 2;
+  align: center middle;
+}
+
+#loading-text {
+  content-align: center middle;
+  text-align: center;
+  padding: 1;
 }

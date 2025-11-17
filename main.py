@@ -1,7 +1,8 @@
-from typing import cast, Dict, Tuple, List, DefaultDict
+from typing import cast, Dict, Tuple, List, DefaultDict, Iterable
 from textual.app import App, ComposeResult
 from textual.screen import Screen, ModalScreen
-from textual.widgets import Static, SelectionList, ListView, ListItem, Button
+from textual.widgets import Static, SelectionList, ListView, ListItem, Button, Input, Tree, Select
+from textual.widgets.tree import TreeNode
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual import events
 
@@ -10,42 +11,81 @@ from rich.text import Text
 from rich.markup import escape
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
+try:
+    from dateutil import parser as date_parser
+    HAS_DATEUTIL = True
+except ImportError:
+    HAS_DATEUTIL = False
+    date_parser = None  # type: ignore
 from html.parser import HTMLParser
+import asyncio
+import re
 
-from db import init_db, save_entries, mark_as_read, get_read_entries
+from db import init_db, save_entries, mark_as_read, get_read_entries, is_entry_indexed, update_entry_full_text, search_entries, index_all_unindexed_entries, mark_as_detail_viewed, mark_as_opened, get_detail_viewed_entries, get_opened_entries, get_cached_article_text, cache_article_text, save_selected_sources, get_selected_sources, save_language, get_language, get_entries_by_sources
+from rss_fetcher_service import RSSFetcherService
 from image_processor import process_images_in_html
+from translations import TRANSLATIONS
+from rss_sources import SOURCES
 
 try:
     from newspaper import Article
     HAS_NEWSPAPER = True
 except ImportError:
     HAS_NEWSPAPER = False
-    print("Warning: newspaper3k not installed")
+    print("Warning: newspaper4k not installed")
 
-TEXT = """\
-Docking a widget removes it from the layout and fixes its position, aligned to either the top, right, bottom, or left edges of a container.
 
-Docked widgets will not scroll out of view, making them ideal for sticky headers, footers, and sidebars.
-
-"""
+class LoadingScreen(ModalScreen):
+    """Modal screen for showing loading indicator"""
+    CSS_PATH = "xcss.tcss"
+    
+    def __init__(self, language: str = "hu") -> None:
+        super().__init__()
+        self.language = language
+    
+    def compose(self) -> ComposeResult:
+        with Vertical(id="loading-container"):
+            yield Static(TRANSLATIONS.get(self.language, TRANSLATIONS["hu"])["loading"], id="loading-text")
+    
+    def on_mount(self) -> None:
+        """Start animation when screen is mounted"""
+        self._animate_loading()
+    
+    def _animate_loading(self) -> None:
+        """Animate loading text with dots"""
+        loading_text = self.query_one("#loading-text", Static)
+        dots = ["", ".", "..", "..."]
+        dot_index = 0
+        
+        def update_dots() -> None:
+            nonlocal dot_index
+            base_text = TRANSLATIONS.get(self.language, TRANSLATIONS["hu"])["loading"]
+            # Remove existing dots if any, then add new ones
+            base_text_clean = base_text.rstrip(".")
+            loading_text.update(f"{base_text_clean}{dots[dot_index]}")
+            dot_index = (dot_index + 1) % len(dots)
+            self.set_timer(0.5, update_dots)
+        
+        self.set_timer(0.5, update_dots)
 
 
 class ArticleScreen(ModalScreen):
     """Modal screen for displaying full article content"""
     CSS_PATH = "xcss.tcss"
     
-    BINDINGS = [
-        ("escape", "close", "Bezárás"),
-    ]
-    
-    def __init__(self, title: str, content: str, source: str, link: str) -> None:
+    def __init__(self, title: str, content: str, source: str, link: str, language: str = "hu") -> None:
         super().__init__()
         self.article_title = title
         self.article_content = content
         self.article_source = source
         self.article_link = link
+        self.language = language
     
     def compose(self) -> ComposeResult:
+        t = TRANSLATIONS.get(self.language, TRANSLATIONS["hu"])
+        self.BINDINGS = [
+            ("escape", "close", t["close"]),
+        ]
         # Parse markup strings into Text objects with error handling
         try:
             article_title_text = Text.from_markup(f"[bold]{escape(self.article_title)}[/bold]")
@@ -73,7 +113,9 @@ class ArticleScreen(ModalScreen):
             article_link_text = escape(self.article_link)
         
         with Vertical(id="article-container"):
-            yield Static(article_title_text, id="article-header")
+            with Horizontal(id="article-header"):
+                yield Static(article_title_text, id="article-title")
+                yield Button("✕", id="close-x-btn", variant="default")
             yield Static(article_source_text, id="article-subheader")
             with ScrollableContainer(id="article-body"):
                 yield Static(article_content_text, id="article-text")
@@ -85,33 +127,59 @@ class ArticleScreen(ModalScreen):
         self.dismiss()
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "close-btn":
+        if event.button.id == "close-btn" or event.button.id == "close-x-btn":
             self.action_close()
+    
 
 
 class DockLayoutExample(App[None]):
     CSS_PATH = "xcss.tcss"
 
-    # Map SelectionList values -> (name, feed_url)
-    SOURCES: Dict[int, Tuple[str, str]] = {
-        0: ("telex.hu", "https://telex.hu/rss"),
-        1: ("444.hu", "https://444.hu/feed"),
-        2: ("hvg.hu", "https://hvg.hu/rss"),
-        3: ("magyarnarancs.hu", "https://magyarnarancs.hu/rss"),
-        4: ("24.hu", "https://24.hu/rss"),
-        5: ("hang.hu", "https://hang.hu/feed"),
-    }
+    def get_country_name(self, country_code: str) -> str:
+        """Get translated country name"""
+        return self.t(f"country_{country_code}")
 
     # Pressing Tab moves focus to the content list
     BINDINGS = [
-        ("tab", "focus_content", "Fókusz a tartalomra"),
-        ("j", "cursor_down", "Le"),
-        ("k", "cursor_up", "Fel"),
-        ("down", "cursor_down", "Le"),
-        ("up", "cursor_up", "Fel"),
-        ("enter", "show_detail", "Teljes cikk"),
-        ("delete", "mark_read", "Olvasottnak jelölés"),
+        ("tab", "focus_content", "Focus"),
+        ("j", "cursor_down", "Down"),
+        ("k", "cursor_up", "Up"),
+        ("down", "cursor_down", "Down"),
+        ("up", "cursor_up", "Up"),
+        ("pageup", "page_up", "Page Up"),
+        ("pagedown", "page_down", "Page Down"),
+        ("enter", "show_detail", "Full article"),
+        ("delete", "mark_read", "Mark read"),
+        ("ctrl+q", "quit", "Quit"),
+        ("l", "change_language", "Language"),
     ]
+    
+    # Supported languages
+    LANGUAGES = {
+        "en": "English",
+        "hu": "Magyar",
+        "fr": "Français",
+        "it": "Italiano",
+        "es": "Español",
+        "pt": "Português",
+        "de": "Deutsch",
+    }
+    
+    def __init__(self) -> None:
+        super().__init__()
+        # Load saved language from database, or use default
+        init_db()  # Ensure database is initialized
+        saved_language = get_language()
+        self.language = saved_language if saved_language else "hu"  # Default language
+        
+        # Start RSS fetcher service in background
+        self.fetcher_service = RSSFetcherService(fetch_interval=60)
+        self.fetcher_service.start()
+    
+    def t(self, key: str) -> str:
+        """Get translation for current language"""
+        lang = str(self.language) if self.language else "hu"
+        return TRANSLATIONS.get(lang, TRANSLATIONS["hu"]).get(key, key)
 
     # Store rendered entries to show details on highlight
     _entries: List[tuple[str, RssEntry]]
@@ -122,6 +190,18 @@ class DockLayoutExample(App[None]):
     _read_entries: set[str]
     # Track new entries for visual distinction
     _new_entries: set[str]
+    # Track entries that were shown in detail view (bottom panel)
+    _detail_viewed_entries: set[str]
+    # Track entries that were opened in modal window
+    _opened_entries: set[str]
+    # Current search query
+    _search_query: str = ""
+    # Timer for search debounce
+    _search_timer = None
+    # Page tracking for windowed view
+    _page_offset: int = 0  # Index of first visible entry
+    _page_size: int = 20  # Number of visible items (will be calculated dynamically)
+    _last_page_offset: int = 0  # Track previous page offset to detect page changes
 
     class _RichMarkupHTMLParser(HTMLParser):
         def __init__(self) -> None:
@@ -209,18 +289,114 @@ class DockLayoutExample(App[None]):
             return escape(html)
         return parser.get_value()
 
-    def Sidebar(self):
-        return SelectionList[int](  
-            ('telex.hu', 0, True),
-            ('444.hu', 1, True),
-            ('hvg.hu', 2, True),
-            ('magyarnarancs.hu', 3),
-            ('24.hu', 4),
-            ('hang.hu', 5),
-        )
+    def _highlight_search_terms(self, text: str, search_query: str, preserve_markup: bool = False) -> str:
+        """
+        Highlight search terms in text using Rich markup.
+        Returns the text with search terms wrapped in [bold yellow] tags.
+        If preserve_markup is True, preserves existing Rich markup (like <rich>...</rich> blocks).
+        """
+        if not search_query or len(search_query.strip()) < 3:
+            return text
+        
+        # Split query into keywords
+        keywords = [kw.strip() for kw in search_query.split() if kw.strip()]
+        if not keywords:
+            return text
+        
+        # If preserve_markup is True, protect markup blocks
+        if preserve_markup and '<rich>' in text:
+            # Split text into parts: markup blocks and regular text
+            parts = []
+            current_pos = 0
+            for match in re.finditer(r'<rich>.*?</rich>', text, re.DOTALL | re.IGNORECASE):
+                # Add text before the markup block
+                if match.start() > current_pos:
+                    text_before = text[current_pos:match.start()]
+                    # Highlight keywords in text before
+                    for keyword in keywords:
+                        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+                        text_before = pattern.sub(
+                            lambda m: f"[bold yellow]{m.group()}[/bold yellow]",
+                            escape(text_before)
+                        )
+                    parts.append(text_before)
+                # Add the markup block unchanged
+                parts.append(match.group())
+                current_pos = match.end()
+            # Add remaining text after last markup block
+            if current_pos < len(text):
+                text_after = text[current_pos:]
+                for keyword in keywords:
+                    pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+                    text_after = pattern.sub(
+                        lambda m: f"[bold yellow]{m.group()}[/bold yellow]",
+                        escape(text_after)
+                    )
+                parts.append(text_after)
+            return ''.join(parts)
+        else:
+            # Simple case: escape and highlight
+            escaped_text = escape(text)
+            highlighted_text = escaped_text
+            for keyword in keywords:
+                pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+                highlighted_text = pattern.sub(
+                    lambda m: f"[bold yellow]{m.group()}[/bold yellow]",
+                    highlighted_text
+                )
+            return highlighted_text
+
+    def Sidebar(self, selected_sources: set[int] | None = None):
+        # Ensure database is initialized before trying to read from it
+        init_db()
+        # Use provided selected_sources, or load from database
+        if selected_sources is None:
+            selected_sources = get_selected_sources()
+        # If no saved selection, use default (first 3 Hungarian sources)
+        if not selected_sources:
+            selected_sources = {0, 1, 2}
+        
+        # Create Tree widget
+        tree = Tree(self.t("rss_sources"), id="sources-tree")
+        tree.show_root = False
+        
+        # Group sources by country code
+        countries: Dict[str, List[Tuple[int, str, str, str]]] = {}
+        for source_id, (country_code, name, url) in SOURCES.items():
+            if country_code not in countries:
+                countries[country_code] = []
+            countries[country_code].append((source_id, country_code, name, url))
+        
+        # Sort countries alphabetically by translated name
+        sorted_countries = sorted(countries.keys(), key=lambda cc: self.get_country_name(cc))
+        
+        # Add countries as parent nodes and sources as child nodes
+        for country_code in sorted_countries:
+            country_name = self.get_country_name(country_code)
+            country_node = tree.root.add(country_name, data={"type": "country", "country": country_code})
+            # Expand by default if any source in this country is selected
+            country_selected = any(sid in selected_sources for sid, _, _, _ in countries[country_code])
+            if country_selected:
+                country_node.expand()
+            
+            for source_id, country_code, name, url in sorted(countries[country_code], key=lambda x: x[2]):
+                is_selected = source_id in selected_sources
+                # Add checkbox indicator (using ASCII-compatible characters)
+                label = f"{'[X]' if is_selected else '[ ]'} {name}"
+                source_node = country_node.add(label, data={"type": "source", "source_id": source_id, "name": name, "url": url, "selected": is_selected})
+        
+        return tree
 
     def compose(self) -> ComposeResult:
-        yield Static("RSS Text — v0.1 | Tab: váltás | ↑↓/jk: navigálás | Enter: teljes cikk | Del: olvasott", id="header")
+        with Horizontal(id="header"):
+            yield Static(self.t("header"), id="header-text")
+            yield Select(
+                [(name, code) for code, name in self.LANGUAGES.items()],
+                value=self.language,
+                id="language-select",
+                prompt=self.t("language"),
+            )
+        yield Input(placeholder=self.t("search_placeholder"), id="search-input")
         with Horizontal(id="main"):
             with Static('sidebar', id='sidebar'):
                 yield self.Sidebar()
@@ -240,26 +416,333 @@ class DockLayoutExample(App[None]):
             list_view.focus()
 
     def action_cursor_down(self) -> None:
-        self.query_one("#list", ListView).action_cursor_down()
+        if self.focused and hasattr(self.focused, 'id') and self.focused.id == "search-input":
+            return
+        list_view = self.query_one("#list", ListView)
+        if self.focused != list_view:
+            list_view.focus()
+        
+        # Get current index in visible list
+        current_visible_idx = getattr(list_view, "index", 0) or 0
+        visible_count = len(list_view.children)
+        
+        # Check if we're at the bottom of visible page
+        if current_visible_idx >= visible_count - 1:
+            # At bottom - check if we can page down
+            if hasattr(self, "_entries") and self._entries:
+                total_entries = len(self._entries)
+                current_page_end = self._page_offset + visible_count
+                if current_page_end < total_entries:
+                    # Move page down by one - show next page
+                    self._page_offset = self._page_offset + 1
+                    self.log(f"Cursor down at bottom: paging down, new offset={self._page_offset}")
+                    # Re-render with new page
+                    self._render_entries_into_list(self._entries, preserve_position=True)
+                    # Set cursor to first item of new page
+                    list_view = self.query_one("#list", ListView)
+                    if len(list_view.children) > 0:
+                        list_view.index = 0
+                    self._update_detail_from_list()
+                    return
+                else:
+                    # Already at the end, don't move
+                    self.log(f"Cursor down at bottom: already at end")
+                    return
+        # Not at bottom, just move cursor down
+        list_view.action_cursor_down()
         self._update_detail_from_list()
 
     def action_cursor_up(self) -> None:
-        self.query_one("#list", ListView).action_cursor_up()
+        if self.focused and hasattr(self.focused, 'id') and self.focused.id == "search-input":
+            return
+        list_view = self.query_one("#list", ListView)
+        if self.focused != list_view:
+            list_view.focus()
+        
+        # Get current index in visible list
+        current_visible_idx = getattr(list_view, "index", 0) or 0
+        
+        # Check if we're at the top of visible page
+        if current_visible_idx == 0:
+            # At top - check if we can page up
+            if self._page_offset > 0:
+                # Move page up by one - show previous page
+                self._page_offset = max(0, self._page_offset - 1)
+                self.log(f"Cursor up at top: paging up, new offset={self._page_offset}")
+                # Re-render with new page
+                if hasattr(self, "_entries") and self._entries:
+                    self._render_entries_into_list(self._entries, preserve_position=True)
+                    # Set cursor to last item of new page
+                    list_view = self.query_one("#list", ListView)
+                    if len(list_view.children) > 0:
+                        list_view.index = len(list_view.children) - 1
+                    self._update_detail_from_list()
+                    return
+            else:
+                # Already at the beginning, don't move
+                self.log(f"Cursor up at top: already at beginning")
+                return
+        # Not at top, just move cursor up
+        list_view.action_cursor_up()
         self._update_detail_from_list()
+    
+    def action_page_up(self) -> None:
+        """Move page up - replace all visible entries with previous page"""
+        if not hasattr(self, "_entries") or not self._entries:
+            return
+        list_view = self.query_one("#list", ListView)
+        if self.focused != list_view:
+            list_view.focus()
+        
+        # Move page up by page_size - replace all visible entries with previous page
+        new_offset = max(0, self._page_offset - self._page_size)
+        if new_offset != self._page_offset:
+            self._page_offset = new_offset
+            # Render new page - don't preserve position, start from first item of new page
+            self._render_entries_into_list(self._entries, preserve_position=False)
+            # Set cursor to first item of new page
+            if len(list_view.children) > 0:
+                list_view.index = 0
+        self._update_detail_from_list()
+    
+    def action_page_down(self) -> None:
+        """Move page down - replace all visible entries with next page"""
+        self.log(f"=== Page Down action called! ===")
+        self.log(f"Current offset: {getattr(self, '_page_offset', 0)}")
+        
+        if not hasattr(self, "_entries") or not self._entries:
+            self.log("No entries available")
+            return
+        
+        list_view = self.query_one("#list", ListView)
+        if self.focused != list_view:
+            list_view.focus()
+        
+        # Get current page_size
+        current_page_size = getattr(self, "_page_size", 20)
+        current_offset = getattr(self, "_page_offset", 0)
+        total_entries = len(self._entries)
+        
+        self.log(f"Offset: {current_offset}, Page size: {current_page_size}, Total entries: {total_entries}")
+        
+        # Calculate new offset - move forward by one page
+        new_offset = current_offset + current_page_size
+        
+        self.log(f"New offset would be: {new_offset}")
+        
+        # Only move if there are more entries to show
+        if new_offset <= total_entries:
+            # Update offset
+            old_offset = self._page_offset
+            self._page_offset = new_offset
+            self.log(f"Offset changed: {old_offset} -> {self._page_offset}")
+            # Force render with new page - this will replace all visible entries
+            self._render_entries_into_list(self._entries, preserve_position=False)
+            # Set cursor to first item of new page
+            list_view = self.query_one("#list", ListView)
+            visible_count = len(list_view.children)
+            self.log(f"After render: visible items: {visible_count}")
+            if visible_count > 0:
+                list_view.index = 0
+        else:
+            self.log(f"Cannot move: new_offset {new_offset} > total {total_entries}")
+        self._update_detail_from_list()
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        """Handle Tree node selection - toggle source selection or filter by country"""
+        node = event.node
+        if node.data and node.data.get("type") == "source":
+            # Toggle selection
+            is_selected = not node.data.get("selected", False)
+            node.data["selected"] = is_selected
+            source_id = node.data["source_id"]
+            name = node.data["name"]
+            
+            # Update checkbox in label (using ASCII-compatible characters)
+            label = f"{'[X]' if is_selected else '[ ]'} {name}"
+            node.set_label(label)
+            
+            # Update selection and render
+            new_selected = self._get_selected_sources_from_tree()
+            if new_selected != self._last_selected:
+                self._last_selected = new_selected
+                save_selected_sources(self._last_selected)
+                # Render immediately (will use cache if available)
+                self._render_from_selection()
+            self.set_status(f"[green]{self.t('selected') if is_selected else self.t('deselected')}:[/] {name}")
+        elif node.data and node.data.get("type") == "country":
+            # Filter by country: select/deselect all sources in this country
+            country_code = node.data.get("country")
+            if country_code:
+                # Get all sources in this country
+                country_sources = [sid for sid, (cc, _, _) in SOURCES.items() if cc == country_code]
+                
+                # Check if all sources in country are selected
+                current_selected = self._get_selected_sources_from_tree()
+                all_selected = all(sid in current_selected for sid in country_sources)
+                
+                # Toggle all sources in country
+                tree = self.query_one("#sources-tree", Tree)
+                for source_id in country_sources:
+                    # Find the source node
+                    for child in node.children:
+                        if child.data and child.data.get("type") == "source" and child.data.get("source_id") == source_id:
+                            # Toggle selection
+                            new_selected_state = not all_selected
+                            child.data["selected"] = new_selected_state
+                            source_name = child.data.get("name", "")
+                            label = f"{'[X]' if new_selected_state else '[ ]'} {source_name}"
+                            child.set_label(label)
+                            break
+                
+                # Update selection and render
+                new_selected = self._get_selected_sources_from_tree()
+                if new_selected != self._last_selected:
+                    self._last_selected = new_selected
+                    save_selected_sources(self._last_selected)
+                    # Render immediately (will use cache if available)
+                    self._render_from_selection()
+                
+                country_name = self.get_country_name(country_code)
+                action = self.t('selected') if not all_selected else self.t('deselected')
+                self.set_status(f"[green]{action}:[/] {country_name} ({len(country_sources)} {self.t('sources')})")
+            else:
+                # Fallback: just toggle expand/collapse
+                if node.is_expanded:
+                    node.collapse()
+                else:
+                    node.expand()
+    
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Handle language selection change"""
+        if event.select.id == "language-select":
+            if event.select.value is not None:
+                self.language = str(event.select.value)
+                # Save language to database
+                save_language(self.language)
+            # Update header text
+            header_text = self.query_one("#header-text", Static)
+            header_text.update(self.t("header"))
+            # Update search placeholder
+            search_input = self.query_one("#search-input", Input)
+            search_input.placeholder = self.t("search_placeholder")
+            # Rebuild sidebar tree to update country names
+            sidebar_container = self.query_one("#sidebar", Static)
+            old_tree = self.query_one("#sources-tree", Tree)
+            # Save selected sources before removing
+            selected_sources = self._get_selected_sources_from_tree()
+            old_tree.remove()
+            # Wait a bit for the removal to complete
+            def rebuild_tree():
+                new_tree = self.Sidebar(selected_sources=selected_sources)
+                sidebar_container.mount(new_tree)
+                # Restore selection after rebuild
+                self._last_selected = selected_sources
+                # Save to database to keep it in sync
+                save_selected_sources(selected_sources)
+                self.refresh()
+            self.set_timer(0.01, rebuild_tree)
+    
+    def action_change_language(self) -> None:
+        """Action to change language - cycles through languages"""
+        lang_codes = list(self.LANGUAGES.keys())
+        current_lang = str(self.language) if self.language else "hu"
+        current_index = lang_codes.index(current_lang) if current_lang in lang_codes else 0
+        next_index = (current_index + 1) % len(lang_codes)
+        self.language = lang_codes[next_index]
+        # Save language to database
+        save_language(self.language)
+        # Update Select widget
+        language_select = self.query_one("#language-select", Select)
+        language_select.value = self.language
+        # Update header text
+        header_text = self.query_one("#header-text", Static)
+        header_text.update(self.t("header"))
+        # Update search placeholder
+        search_input = self.query_one("#search-input", Input)
+        search_input.placeholder = self.t("search_placeholder")
+        # Rebuild sidebar tree to update country names
+        sidebar_container = self.query_one("#sidebar", Static)
+        old_tree = self.query_one("#sources-tree", Tree)
+        # Save selected sources before removing
+        selected_sources = self._get_selected_sources_from_tree()
+        old_tree.remove()
+        # Wait a bit for the removal to complete
+        def rebuild_tree():
+            new_tree = self.Sidebar()
+            sidebar_container.mount(new_tree)
+            # Restore selection after rebuild
+            self._last_selected = selected_sources
+            self.refresh()
+        self.set_timer(0.01, rebuild_tree)
+    
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        """Handle ListView highlight changes (works for both j/k and arrow keys)"""
+        # Update detail view whenever the highlighted item changes in our list
+        # This ensures the summary appears when navigating with arrow keys too
+        self._update_detail_from_list()
+    
+    def on_key(self, event: events.Key) -> None:
+        """Handle key events - intercept Page Down/Up before ListView can handle them"""
+        # Only intercept Page Down/Up when ListView is focused
+        # Let all other keys pass through normally
+        if event.key in ("pagedown", "pageup"):
+            if self.focused and hasattr(self.focused, 'id') and self.focused.id == "list":
+                event.prevent_default()
+                if event.key == "pagedown":
+                    self.log("=== Page Down key intercepted! ===")
+                    self.action_page_down()
+                elif event.key == "pageup":
+                    self.log("=== Page Up key intercepted! ===")
+                    self.action_page_up()
+                return
+        # For all other keys, don't do anything - let them be handled normally
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Handle ListView selection (Enter key pressed or mouse click) - show full article"""
+        # When Enter is pressed in the list or item is clicked, show the full article
+        list_view = getattr(event, 'list_view', None) or getattr(event, 'control', None)
+        if list_view and getattr(list_view, 'id', None) == "list":
+            self.action_show_detail()
+    
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle search input changes with debounce"""
+        if event.input.id == "search-input":
+            query = event.value.strip()
+            self._search_query = query
+            
+            # Cancel previous timer if exists
+            if self._search_timer is not None:
+                self._search_timer.stop()
+            
+            # If query is empty, clear search immediately
+            if len(query) == 0:
+                self._render_from_selection()
+                return
+            
+            # Only search if at least 3 characters, with 1 second debounce
+            if len(query) >= 3:
+                def perform_search():
+                    self._render_search_results()
+                    self._search_timer = None
+                
+                self._search_timer = self.set_timer(1.0, perform_search)
 
     def action_mark_read(self) -> None:
         # Mark current article as read
         if not hasattr(self, "_entries") or not self._entries:
-            self.set_status("[red]Nincs kiválasztott bejegyzés[/red]")
+            self.set_status(f"[red]{self.t('no_selection')}[/red]")
             return
         
         list_view = self.query_one("#list", ListView)
-        idx = getattr(list_view, "index", 0) or 0
-        if idx < 0 or idx >= len(self._entries):
-            self.set_status("[red]Nincs kiválasztott bejegyzés[/red]")
+        # Get visible index and map to absolute index
+        visible_idx = getattr(list_view, "index", 0) or 0
+        absolute_idx = self._page_offset + visible_idx
+        if absolute_idx < 0 or absolute_idx >= len(self._entries):
+            self.set_status(f"[red]{self.t('no_selection')}[/red]")
             return
         
-        name, entry = self._entries[idx]
+        name, entry = self._entries[absolute_idx]
         entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
         
         # Mark as read in database
@@ -271,44 +754,81 @@ class DockLayoutExample(App[None]):
         
         # Remove from displayed list
         self._render_from_selection()
-        self.set_status(f"[green]Olvasottnak jelölve: {name}[/green]")
+        self.set_status(f"[green]{self.t('marked_read')}: {name}[/green]")
     
     def action_show_detail(self) -> None:
         # Download and show full article in modal screen
-        if not hasattr(self, "_entries") or not self._entries:
-            self.set_status("[red]Nincs kiválasztott bejegyzés[/red]")
-            return
-        
+        # Ensure list view has focus when Enter is pressed
         list_view = self.query_one("#list", ListView)
-        idx = getattr(list_view, "index", 0) or 0
-        if idx < 0 or idx >= len(self._entries):
-            self.set_status("[red]Nincs kiválasztott bejegyzés[/red]")
+        if self.focused != list_view and not (self.focused and hasattr(self.focused, 'id') and self.focused.id == "search-input"):
+            list_view.focus()
+        
+        if not hasattr(self, "_entries") or not self._entries:
+            self.set_status(f"[red]{self.t('no_selection')}[/red]")
             return
         
-        name, entry = self._entries[idx]
+        # Get visible index and map to absolute index
+        visible_idx = getattr(list_view, "index", 0) or 0
+        absolute_idx = self._page_offset + visible_idx
+        if absolute_idx < 0 or absolute_idx >= len(self._entries):
+            self.set_status(f"[red]{self.t('no_selection')}[/red]")
+            return
         
-        # Check if newspaper3k is available
+        name, entry = self._entries[absolute_idx]
+        
+        # Check if newspaper4k is available
         if not HAS_NEWSPAPER:
-            self.set_status("[red]newspaper3k nincs telepítve[/red]")
+            self.set_status(f"[red]{self.t('newspaper_not_installed')}[/red]")
             return
         
         # Get the article URL
         article_url = entry.link or ""
         if not article_url:
-            self.set_status("[red]Nincs elérhető link[/red]")
+            self.set_status(f"[red]{self.t('no_link')}[/red]")
             return
         
-        # Download article with newspaper3k
-        self.set_status("[yellow]Cikk letöltése...[/yellow]")
-        try:
-            article = Article(article_url, language='hu')
-            article.download()
-            article.parse()
+        # Show loading screen and start async download
+        loading_screen = LoadingScreen(str(self.language) if self.language else "hu")
+        self.push_screen(loading_screen)
+        # Use set_timer to ensure the loading screen is rendered before starting the worker
+        def start_download():
+            self.run_worker(self._download_article_async(entry, name, article_url, loading_screen))
+        self.set_timer(0.1, start_download)
+    
+    async def _download_article_async(self, entry: RssEntry, name: str, article_url: str, loading_screen: LoadingScreen) -> None:
+        """Download article asynchronously"""
+        entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
+        
+        # Check if article is cached
+        cached_text = get_cached_article_text(entry_id)
+        if cached_text:
+            # Use cached article text
+            article_text = cached_text
+            title = entry.title or f"({self.t('no_title')})"
+            self.pop_screen()
+            self.push_screen(ArticleScreen(title, article_text, name, article_url, str(self.language) if self.language else "hu"))
+            self.set_status(f"[green]{self.t('article_opened_cache')}: {name}[/green]")
             
-            # Get the article content - prefer plain text from newspaper3k
+            # Mark this entry as opened in modal window
+            was_already_opened = entry_id in self._opened_entries
+            if not was_already_opened:
+                self._opened_entries.add(entry_id)
+                mark_as_opened(entry_id)
+                # Update the list to show the opened indicator
+                if hasattr(self, "_entries"):
+                    self._render_entries_into_list(self._entries, preserve_position=True)
+            return
+        
+        try:
+            # Download article with newspaper4k - run blocking operations in thread pool
+            article = Article(article_url, language='hu')
+            await asyncio.to_thread(article.download)
+            await asyncio.to_thread(article.parse)
+            
+            # Get the article content - prefer plain text from newspaper4k
             article_text = ""
             
-            # Use plain text first (newspaper3k extracts clean article text)
+            # Use plain text first (newspaper4k extracts clean article text)
             if article.text:
                 article_text = escape(article.text)
             
@@ -322,69 +842,357 @@ class DockLayoutExample(App[None]):
                     except Exception:
                         article_text = escape(summary_html)
             
-            # Show modal screen with article
+            # Cache the article text
+            if article_text:
+                cache_article_text(entry_id, article_text)
+            
+            # Close loading screen and show article
             title = article.title or entry.title or "(cím nélkül)"
-            self.push_screen(ArticleScreen(title, article_text, name, article_url))
-            self.set_status(f"[green]Cikk megnyitva: {name}[/green]")
+            # Textual workers run in the same thread, so we can call UI methods directly
+            self.pop_screen()
+            self.push_screen(ArticleScreen(title, article_text, name, article_url, str(self.language) if self.language else "hu"))
+            self.set_status(f"[green]{self.t('article_opened')}: {name}[/green]")
+            
+            # Index the full article text for search
+            if article_text:
+                # Combine title and full text for search
+                full_searchable_text = f"{title} {article_text}".strip()
+                was_indexed = is_entry_indexed(entry_id)
+                update_entry_full_text(entry_id, full_searchable_text)
+                if not was_indexed:
+                    self.set_status(f"[yellow]{self.t('indexing')}:[/] {self.t('article_indexed')}")
+                self.log(f"DB: Cikk teljes szövege indexelve: {title[:50]}...")
+            
+            # Mark this entry as opened in modal window
+            was_already_opened = entry_id in self._opened_entries
+            if not was_already_opened:
+                self._opened_entries.add(entry_id)
+                mark_as_opened(entry_id)
+                # Update the list to show the opened indicator
+                if hasattr(self, "_entries"):
+                    self._render_entries_into_list(self._entries, preserve_position=True)
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
             self.log(f"Error downloading article: {error_trace}")
-            self.set_status(f"[red]Hiba a cikk letöltésekor: {e}[/red]")
+            self.pop_screen()
+            self.set_status(f"[red]{self.t('download_error')}: {e}[/red]")
             # Fall back to showing summary in modal
             try:
-                title = entry.title or "(cím nélkül)"
+                title = entry.title or f"({self.t('no_title')})"
                 summary_html = entry.summary or ""
                 processed_html, _ = process_images_in_html(summary_html, download_dir="images", base_url=entry.link)
                 article_text = self._html_to_markup(processed_html)
-                self.push_screen(ArticleScreen(title, article_text, name, article_url))
-                self.set_status("[yellow]Összefoglaló megjelenítve (teljes cikk nem elérhető)[/yellow]")
+                self.push_screen(ArticleScreen(title, article_text, name, article_url, str(self.language) if self.language else "hu"))
+                self.set_status(f"[yellow]{self.t('summary_shown')}[/yellow]")
             except Exception as e2:
                 error_trace2 = traceback.format_exc()
                 self.log(f"Error showing summary: {error_trace2}")
-                self.set_status(f"[red]Nem sikerült megnyitni a cikket: {e2}[/red]")
+                self.set_status(f"[red]{self.t('open_error')}: {e2}[/red]")
 
     def set_status(self, message: str) -> None:
         footer = self.query_one("#footer", Static)
         footer.update(Text.from_markup(message))
 
-    def _render_entries_into_list(self, entries: List[tuple[str, RssEntry]]) -> None:
+    def _render_entries_into_list(self, entries: List[tuple[str, RssEntry]], preserve_position: bool = False) -> None:
         list_view = self.query_one("#list", ListView)
-        list_view.clear()
-        for name, entry in entries:
-            title = entry.title or "(cím nélkül)"
-            # Get date in YYYY-MM-DD HH:MM format
-            date_str = self._format_entry_date(entry)
-            entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
-            # Check if this is a new entry
-            is_new = entry_id in self._new_entries
-            if is_new:
-                item_text = Text.from_markup(f"[bold cyan]◆[/bold cyan] [dim]{date_str}[/dim] [bold]{escape(name)}: {escape(title)}[/bold]")
+        
+        # Calculate page size based on ListView height - exactly match visible height
+        try:
+            list_height = list_view.size.height
+            # If height is 0 or very small (not yet initialized), use a reasonable default
+            if list_height <= 0:
+                # Use a larger default if height is not available yet
+                if not hasattr(self, "_page_size") or self._page_size == 20:
+                    self._page_size = 50
             else:
-                item_text = Text.from_markup(f"[dim]{date_str}[/dim] {escape(name)}: {escape(title)}")
-            list_view.append(ListItem(Static(item_text)))
-        # After rendering, move cursor to first item if available
-        if entries:
+                # Use exactly the height - each item is 1 line, so we can fit exactly list_height items
+                # Don't add extra, we want exactly the visible height
+                new_page_size = max(1, list_height)
+                # Update if different
+                if not hasattr(self, "_page_size") or self._page_size != new_page_size:
+                    self._page_size = new_page_size
+        except Exception:
+            # Fallback to default if height calculation fails
+            if not hasattr(self, "_page_size"):
+                self._page_size = 50
+        
+        # Ensure page_offset is valid (don't limit - if there are no entries, empty list is fine)
+        # NEVER limit the offset here - let it go beyond entries, we'll just show empty list
+        # Only ensure it's not negative
+        if self._page_offset < 0:
+            self._page_offset = 0
+        
+        # Only reset offset if we're not preserving position AND there are no entries
+        if not entries and not preserve_position:
+            self._page_offset = 0
+        
+        # Check if entries actually changed (by comparing entry IDs)
+        entries_changed = True
+        # Get last page offset, default to current if not set
+        last_page_offset = getattr(self, "_last_page_offset", self._page_offset)
+        page_changed = (self._page_offset != last_page_offset)
+        if preserve_position and hasattr(self, "_entries") and self._entries:
+            # Compare entry IDs to see if list actually changed
+            old_entry_ids = {e.entry_id or f"{name}:{e.link or e.title}" for name, e in self._entries}
+            new_entry_ids = {e.entry_id or f"{name}:{e.link or e.title}" for name, e in entries}
+            entries_changed = (old_entry_ids != new_entry_ids)
+        
+        # Save current cursor position and focus state if we want to preserve it
+        current_entry_id = None
+        current_absolute_index = None  # Index in full entries list
+        current_visible_index = None  # Index in visible page
+        was_focused = False
+        
+        # Only skip rendering if entries didn't change AND page didn't change AND preserving position
+        if preserve_position and hasattr(self, "_entries") and self._entries and not entries_changed and not page_changed:
+            # If entries didn't change and page didn't change, just update indicators and return early
+            current_visible_index = getattr(list_view, "index", None)
+            if current_visible_index is not None and 0 <= current_visible_index < len(list_view.children):
+                # Map visible index to absolute index
+                current_absolute_index = self._page_offset + current_visible_index
+                if 0 <= current_absolute_index < len(self._entries):
+                    _, current_entry = self._entries[current_absolute_index]
+                    current_entry_id = current_entry.entry_id or f"{self._entries[current_absolute_index][0]}:{current_entry.link or current_entry.title}"
+            # Only update indicators for changed entries, don't rebuild entire list
+            self._entries = entries
+            self._update_detail_from_list()
+            return
+        
+        # Save current position if preserving
+        if preserve_position and hasattr(self, "_entries") and self._entries:
+            current_visible_index = getattr(list_view, "index", None)
+            if current_visible_index is not None and 0 <= current_visible_index < len(list_view.children):
+                # Map visible index to absolute index
+                current_absolute_index = self._page_offset + current_visible_index
+                if 0 <= current_absolute_index < len(self._entries):
+                    _, current_entry = self._entries[current_absolute_index]
+                    current_entry_id = current_entry.entry_id or f"{self._entries[current_absolute_index][0]}:{current_entry.link or current_entry.title}"
+            # Check if list_view was focused before clearing
+            was_focused = (hasattr(self, 'focused') and self.focused == list_view)
+        
+        # Get visible entries slice (only render what's visible)
+        # If offset is beyond entries, show empty list (that's fine, it means we've reached the end)
+        if not entries:
+            visible_entries = []
+        elif self._page_offset >= len(entries):
+            visible_entries = []
+        else:
+            end_offset = min(self._page_offset + self._page_size, len(entries))
+            visible_entries = entries[self._page_offset:end_offset]
+        
+        # Debug: log what we're rendering
+        self.log(f"Render: offset={self._page_offset}, page_size={self._page_size}, total={len(entries)}, visible={len(visible_entries)}, entries_changed={entries_changed}, page_changed={page_changed}, preserve={preserve_position}")
+        
+        # Always clear and rebuild when page changes or entries change
+        # (page changes always require rebuild, even with preserve_position)
+        if entries_changed or page_changed or not preserve_position:
+            self.log(f"Clearing list and rebuilding...")
+            list_view.clear()
+            # Check if we're in search mode
+            is_search_mode = hasattr(self, "_search_query") and self._search_query and len(self._search_query.strip()) >= 3
+            
+            # Build all items first, then append in batch (only for visible entries)
+            items_to_add = []
+            for idx, (name, entry) in enumerate(visible_entries):
+                # Calculate absolute index in full entries list
+                absolute_idx = self._page_offset + idx
+                
+                title = entry.title or f"({self.t('no_title')})"
+                # Get date in YYYY-MM-DD HH:MM format
+                date_str = self._format_entry_date(entry)
+                entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
+                # Check if this is a new entry
+                is_new = entry_id in self._new_entries
+                # Check if this entry was viewed in detail view
+                is_detail_viewed = entry_id in getattr(self, "_detail_viewed_entries", set())
+                # Check if this entry was opened in modal window
+                is_opened = entry_id in getattr(self, "_opened_entries", set())
+                
+                # Highlight search terms in title if in search mode
+                if is_search_mode:
+                    highlighted_title = self._highlight_search_terms(title, self._search_query)
+                    highlighted_name = self._highlight_search_terms(name, self._search_query)
+                else:
+                    highlighted_title = escape(title)
+                    highlighted_name = escape(name)
+                
+                # Build indicators (using ASCII-compatible characters)
+                indicators = []
+                if is_new:
+                    indicators.append("[bold cyan]*[/bold cyan]")
+                if is_detail_viewed:
+                    indicators.append("[dim]o[/dim]")
+                if is_opened:
+                    indicators.append("[bold yellow]+[/bold yellow]")
+                
+                indicator_text = " ".join(indicators) + " " if indicators else ""
+                
+                # Add entry number (absolute index + 1 for 1-based display)
+                entry_number = f"[dim]#{absolute_idx + 1}/{len(entries)}[/dim] "
+                
+                if is_new:
+                    item_text = Text.from_markup(f"{entry_number}{indicator_text}[dim]{date_str}[/dim] [bold]{highlighted_name}: {highlighted_title}[/bold]")
+                else:
+                    item_text = Text.from_markup(f"{entry_number}{indicator_text}[dim]{date_str}[/dim] {highlighted_name}: {highlighted_title}")
+                items_to_add.append(ListItem(Static(item_text)))
+            
+            # Batch append all items at once (faster than one-by-one)
+            for item in items_to_add:
+                list_view.append(item)
+        
+        # Restore cursor position if we preserved it
+        if preserve_position and current_entry_id is not None:
+            # Find the entry in the visible entries
+            restored_visible_index = None
+            for idx, (name, entry) in enumerate(visible_entries):
+                entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
+                if entry_id == current_entry_id:
+                    restored_visible_index = idx
+                    break
+            if restored_visible_index is not None:
+                list_view.index = restored_visible_index
+            elif current_visible_index is not None and current_visible_index < len(visible_entries):
+                list_view.index = current_visible_index
+            elif visible_entries:
+                list_view.index = 0
+            # If no visible entries (reached end), don't set index
+        elif visible_entries and entries_changed:
+            # If not preserving position, move to first item
             list_view.index = 0
+        elif not visible_entries:
+            # If no visible entries (reached end), clear the index
+            list_view.index = 0
+        
+        # Restore focus and cursor visibility if it was focused before or we're preserving position
+        if (preserve_position or was_focused) and entries_changed:
+            # Use set_timer to restore focus after rendering
+            def restore_focus():
+                try:
+                    list_view.focus()
+                    # Ensure cursor is visible by setting index again
+                    if preserve_position and current_entry_id is not None:
+                        for idx, (name, entry) in enumerate(visible_entries):
+                            entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
+                            if entry_id == current_entry_id:
+                                list_view.index = idx
+                                break
+                    elif current_visible_index is not None and current_visible_index < len(visible_entries):
+                        list_view.index = current_visible_index
+                except Exception:
+                    pass
+            self.set_timer(0.01, restore_focus)
+        
         self._entries = entries
+        self._last_page_offset = self._page_offset  # Save current page offset
         self._update_detail_from_list()
 
     def _entry_dt(self, e: RssEntry) -> datetime:
+        """Parse published date from RSS entry. Returns datetime for sorting (normalized to UTC)."""
         s = e.published or ""
+        if not s:
+            # If no published date, use a very old date so it appears at the end
+            return datetime(1970, 1, 1, tzinfo=timezone.utc)
+        
+        # Try email.utils.parsedate_to_datetime first (for RFC 2822 format like "Mon, 01 Jan 2024 12:00:00 +0000")
         try:
             dt = parsedate_to_datetime(s)
-            if dt is None:
-                raise ValueError
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+            if dt is not None:
+                # Convert to UTC for consistent sorting
+                if dt.tzinfo is None:
+                    # If no timezone info, assume UTC (don't add timezone, just use as-is for comparison)
+                    # But for proper sorting, we need timezone-aware datetime
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    # Convert to UTC if timezone is present
+                    dt = dt.astimezone(timezone.utc)
+                return dt
         except Exception:
-            return datetime.min.replace(tzinfo=timezone.utc)
+            pass
+        
+        # Try dateutil.parser for ISO 8601 and other formats (like "2024-01-01T12:00:00Z")
+        if HAS_DATEUTIL and date_parser is not None:
+            try:
+                dt = date_parser.parse(s)
+                # Convert to UTC for consistent sorting
+                if dt.tzinfo is None:
+                    # If no timezone info, assume UTC
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    # Convert to UTC if timezone is present
+                    dt = dt.astimezone(timezone.utc)
+                return dt
+            except Exception:
+                pass
+        
+        # If parsing fails, log it and use a very old date so it appears at the end
+        self.log(f"Warning: Could not parse date '{s}' for entry '{e.title[:50]}'")
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
     
     def _format_entry_date(self, e: RssEntry) -> str:
         """Format entry date as YYYY-MM-DD HH:MM"""
         dt = self._entry_dt(e)
         return dt.strftime("%Y-%m-%d %H:%M")
+    
+    def _update_list_item_at_index(self, visible_index: int) -> None:
+        """Update a single list item at the given visible index to reflect current state"""
+        if not hasattr(self, "_entries") or not self._entries:
+            return
+        
+        # Map visible index to absolute index
+        absolute_index = self._page_offset + visible_index
+        if absolute_index < 0 or absolute_index >= len(self._entries):
+            return
+        
+        list_view = self.query_one("#list", ListView)
+        if visible_index < 0 or visible_index >= len(list_view.children):
+            return
+        
+        name, entry = self._entries[absolute_index]
+        title = entry.title or "(cím nélkül)"
+        date_str = self._format_entry_date(entry)
+        entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
+        
+        # Check states
+        is_new = entry_id in self._new_entries
+        is_detail_viewed = entry_id in getattr(self, "_detail_viewed_entries", set())
+        is_opened = entry_id in getattr(self, "_opened_entries", set())
+        is_search_mode = hasattr(self, "_search_query") and self._search_query and len(self._search_query.strip()) >= 3
+        
+        # Highlight search terms if in search mode
+        if is_search_mode:
+            highlighted_title = self._highlight_search_terms(title, self._search_query)
+            highlighted_name = self._highlight_search_terms(name, self._search_query)
+        else:
+            highlighted_title = escape(title)
+            highlighted_name = escape(name)
+        
+        # Build indicators (using ASCII-compatible characters)
+        indicators = []
+        if is_new:
+            indicators.append("[bold cyan]*[/bold cyan]")
+        if is_detail_viewed:
+            indicators.append("[dim]o[/dim]")
+        if is_opened:
+            indicators.append("[bold yellow]+[/bold yellow]")
+        
+        indicator_text = " ".join(indicators) + " " if indicators else ""
+        
+        if is_new:
+            item_text = Text.from_markup(f"{indicator_text}[dim]{date_str}[/dim] [bold]{highlighted_name}: {highlighted_title}[/bold]")
+        else:
+            item_text = Text.from_markup(f"{indicator_text}[dim]{date_str}[/dim] {highlighted_name}: {highlighted_title}")
+        
+        # Update the list item (use visible_index for list_view.children)
+        try:
+            list_item = list_view.children[visible_index]
+            if hasattr(list_item, 'children') and list_item.children:
+                static_widget = list_item.children[0]
+                if hasattr(static_widget, 'update'):
+                    static_widget.update(item_text)
+        except (IndexError, AttributeError):
+            # If update fails, just re-render the whole list
+            self._render_entries_into_list(self._entries, preserve_position=True)
 
     def _update_detail_from_list(self) -> None:
         list_view = self.query_one("#list", ListView)
@@ -392,42 +1200,183 @@ class DockLayoutExample(App[None]):
         if not hasattr(self, "_entries") or not self._entries:
             detail.update("")
             return
-        idx = getattr(list_view, "index", 0) or 0
-        if idx < 0 or idx >= len(self._entries):
+        # Get visible index and map to absolute index
+        visible_idx = getattr(list_view, "index", 0) or 0
+        absolute_idx = self._page_offset + visible_idx
+        if absolute_idx < 0 or absolute_idx >= len(self._entries):
             detail.update("")
             return
-        name, entry = self._entries[idx]
+        name, entry = self._entries[absolute_idx]
+        entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
+        
+        # Remove from new entries if it was marked as new (user has seen it now)
+        was_new = entry_id in self._new_entries
+        if was_new:
+            self._new_entries.discard(entry_id)
+        
+        # Mark this entry as viewed in detail view (so it shows the "viewed" indicator)
+        was_already_viewed = entry_id in self._detail_viewed_entries
+        if not was_already_viewed:
+            self._detail_viewed_entries.add(entry_id)
+            # Save to database
+            mark_as_detail_viewed(entry_id)
+        
+        # Update the list item if state changed (removed "new" or added "viewed")
+        if was_new or not was_already_viewed:
+            # Pass visible index to update method
+            self._update_list_item_at_index(visible_idx)
         title = entry.title or "(cím nélkül)"
         link = entry.link or ""
         published = entry.published or ""
         summary_html = entry.summary or ""
-        # Download/convert images and inline as Rich markup blocks
+        
+        # Check if we're in search mode
+        is_search_mode = hasattr(self, "_search_query") and self._search_query and len(self._search_query.strip()) >= 3
+        
+        # Process images and convert to markup
         processed_html, _ = process_images_in_html(summary_html, download_dir="images", base_url=entry.link)
         summary_markup = self._html_to_markup(processed_html)
-        detail.update(Text.from_markup(
-            f"[bold]{escape(title)}[/bold]\n[dim]{escape(name)}[/dim]\n{escape(published)}\n\n{summary_markup}\n\n[cyan]{escape(link)}[/cyan]"
-        ))
+        
+        # Highlight search terms if in search mode
+        if is_search_mode:
+            highlighted_title = self._highlight_search_terms(title, self._search_query)
+            highlighted_name = self._highlight_search_terms(name, self._search_query)
+            # Don't highlight summary if it contains Rich markup (images) - it would break the markup
+            # Instead, just use the original summary_markup
+            highlighted_summary = summary_markup
+            highlighted_published = self._highlight_search_terms(published, self._search_query)
+        else:
+            highlighted_title = escape(title)
+            highlighted_name = escape(name)
+            highlighted_summary = summary_markup
+            highlighted_published = escape(published)
+        
+        # Build the detail text carefully to avoid markup conflicts
+        # The summary_markup may already contain Rich markup, so we need to handle it separately
+        try:
+            # Create Text objects for each part
+            title_text = Text.from_markup(f"[bold]{highlighted_title}[/bold]")
+            name_text = Text.from_markup(f"[dim]{highlighted_name}[/dim]")
+            published_text = Text.from_markup(highlighted_published) if is_search_mode else Text(highlighted_published)
+            link_text = Text.from_markup(f"[cyan]{escape(link)}[/cyan]")
+            
+            # For summary, try to parse as markup, but fall back to plain text if it fails
+            try:
+                summary_text = Text.from_markup(highlighted_summary)
+            except Exception:
+                # If markup parsing fails, escape and use as plain text
+                summary_text = Text(escape(highlighted_summary))
+            
+            # Combine all parts
+            detail_text = title_text
+            detail_text.append("\n")
+            detail_text.append(name_text)
+            detail_text.append("\n")
+            detail_text.append(published_text)
+            detail_text.append("\n\n")
+            detail_text.append(summary_text)
+            detail_text.append("\n\n")
+            detail_text.append(link_text)
+            
+            detail.update(detail_text)
+        except Exception as e:
+            # Fallback: use plain text if anything goes wrong
+            self.log(f"Error updating detail: {e}")
+            detail.update(f"{title}\n{name}\n{published}\n\n{summary_html}\n\n{link}")
 
     def on_mount(self) -> None:
+        # Initialize database
+        self.set_status(f"[yellow]{self.t('initializing')}:[/] {self.t('db_check')}...")
         init_db()
+        
         self._source_entries = {}
         self._last_selected = set()
+        
+        # Initialize page tracking
+        self._page_offset = 0
+        self._page_size = 20
+        self._last_page_offset = 0
+        
         # Load read entries from database
+        self.set_status(f"[yellow]{self.t('loading_read')}[/]")
         self._read_entries = get_read_entries()
+        
+        # Load viewed entries from database
+        self.set_status(f"[yellow]{self.t('loading_viewed')}[/]")
+        self._detail_viewed_entries = get_detail_viewed_entries()
+        self._opened_entries = get_opened_entries()
+        
         # Track new entries
         self._new_entries = set()
+        
+        # Index all unindexed entries on startup
+        self.set_status(f"[yellow]{self.t('indexing_unindexed')}[/]")
+        indexed_count = index_all_unindexed_entries()
+        if indexed_count > 0:
+            self.set_status(f"[yellow]{self.t('indexing')}:[/] {indexed_count} {self.t('entries_indexed')}")
+            self.log(f"DB: {indexed_count} bejegyzés indexelve az induláskor")
+        else:
+            self.set_status(f"[green]{self.t('indexing')}:[/] {self.t('all_indexed')}")
+        
+        # Load initial feeds
         self._load_initial_feeds()
+        
+        # Recalculate page size after ListView is fully initialized and re-render
+        def recalculate_and_render():
+            try:
+                list_view = self.query_one("#list", ListView)
+                if list_view.size.height > 0:
+                    # Recalculate page size with actual height
+                    list_height = list_view.size.height
+                    new_page_size = max(10, list_height + 2)
+                    # Only update if significantly different
+                    if not hasattr(self, "_page_size") or abs(self._page_size - new_page_size) > 5:
+                        self._page_size = new_page_size
+                        # Re-render to fill the window properly, but preserve position
+                        if hasattr(self, "_entries") and self._entries:
+                            self._render_entries_into_list(self._entries, preserve_position=True)
+            except Exception as e:
+                self.log(f"Error in recalculate_and_render: {e}")
+        self.set_timer(0.5, recalculate_and_render)
+        
+        # Set focus to list view after initial load
+        def set_focus_to_list():
+            try:
+                list_view = self.query_one("#list", ListView)
+                list_view.focus()
+            except Exception:
+                pass  # List view might not be ready yet
+        self.set_timer(0.2, set_focus_to_list)
+        
         # Poll sidebar selection periodically as a robust fallback
         self.set_interval(0.2, self._poll_sidebar_selection)
-        # Refresh feeds every minute
-        self.set_interval(60.0, self._refresh_feeds)
+        # Refresh feeds every 30 seconds (reload from database, fetcher service handles fetching)
+        self.set_interval(30.0, self._refresh_feeds)
+
+    def _get_selected_sources_from_tree(self) -> set[int]:
+        """Get currently selected sources from the tree widget"""
+        try:
+            tree = self.query_one("#sources-tree", Tree)
+            selected = set()
+            # Traverse all nodes to find selected sources
+            def traverse(node: TreeNode):
+                if node.data and node.data.get("type") == "source":
+                    if node.data.get("selected"):
+                        selected.add(node.data["source_id"])
+                for child in node.children:
+                    traverse(child)
+            traverse(tree.root)
+            return selected
+        except Exception:
+            return set()
 
     def _poll_sidebar_selection(self) -> None:
         try:
-            selection_list = cast(SelectionList[int], self.query_one("#sidebar SelectionList", SelectionList))
-            current = set(selection_list.selected)
+            current = self._get_selected_sources_from_tree()
             if current != self._last_selected:
                 self._last_selected = current
+                # Save selected sources to database
+                save_selected_sources(current)
                 self._render_from_selection()
                 sel = ", ".join(str(v) for v in sorted(current)) or "(semmi)"
                 self.set_status(f"[dim]Event:[/] selection_changed(poll)  [dim]Kiválasztva:[/] {sel}")
@@ -438,7 +1387,12 @@ class DockLayoutExample(App[None]):
         """
         Load entries for a source. Returns count of new entries found.
         """
-        name, url = self.SOURCES.get(source_id, (str(source_id), ""))
+        source_data = SOURCES.get(source_id)
+        if not source_data:
+            if source_id not in self._source_entries:
+                self._source_entries[source_id] = []
+            return 0
+        country, name, url = source_data
         if not url:
             if source_id not in self._source_entries:
                 self._source_entries[source_id] = []
@@ -447,6 +1401,10 @@ class DockLayoutExample(App[None]):
         # Don't reload if already loaded (unless checking for updates)
         if source_id in self._source_entries and not check_new:
             return 0
+        
+        # Show loading status only if not in initial load (to avoid too many messages)
+        if check_new:
+            self.set_status(f"[yellow]{self.t('refreshing')}:[/] {name} {self.t('rss_fetch')}")
         
         entries = fetch_rss(url)
         new_count = 0
@@ -466,89 +1424,243 @@ class DockLayoutExample(App[None]):
         try:
             inserted = save_entries(to_save)
             if inserted:
+                if check_new:
+                    self.set_status(f"[green]{self.t('refreshing')}:[/] {inserted} {self.t('new_entries')} {name}")
                 self.log(f"DB: {inserted} új bejegyzés mentve {name}")
         except Exception as e:
             self.log(f"DB mentési hiba: {e}")
         
+        # Index entries that are not yet indexed
+        indexed_count = 0
+        for e in entries:
+            entry_id = e.entry_id or f"{name}:{e.link or e.title}"
+            if not is_entry_indexed(entry_id):
+                # Create searchable text from title and summary
+                searchable_text = f"{e.title or ''} {e.summary or ''}".strip()
+                if searchable_text:
+                    update_entry_full_text(entry_id, searchable_text)
+                    indexed_count += 1
+        
+        if indexed_count > 0 and check_new:
+            self.set_status(f"[yellow]{self.t('indexing')}:[/] {indexed_count} {self.t('entries_indexed_for')} {name}")
+            self.log(f"DB: {indexed_count} bejegyzés indexelve {name}")
+        
         return new_count
 
-    def _render_from_selection(self) -> None:
-        selection_list = cast(SelectionList[int], self.query_one("#sidebar SelectionList", SelectionList))
-        selected_values = list(selection_list.selected)
-        self._last_selected = set(selected_values)
-        # Ensure newly selected sources are loaded
-        for sid in selected_values:
-            self._ensure_source_loaded(sid)
+    def _load_entries_from_db(self, source_ids: Iterable[int]) -> Dict[int, List[RssEntry]]:
+        """
+        Load entries from database for given source IDs.
+        Returns a dictionary mapping source_id to list of RssEntry objects.
+        """
+        if not source_ids:
+            return {}
+        
+        # Get entries from database
+        db_entries = get_entries_by_sources(source_ids)
+        
+        # Convert to RssEntry objects and group by source_id
+        result: Dict[int, List[RssEntry]] = {}
+        for entry_id, source_id, source_name, title, link, published, summary in db_entries:
+            if source_id not in result:
+                result[source_id] = []
+            entry = RssEntry(
+                entry_id=entry_id,
+                title=title,
+                link=link,
+                published=published,
+                summary=summary
+            )
+            result[source_id].append(entry)
+        
+        return result
+
+    def _render_from_selection(self, preserve_position: bool = False) -> None:
+        # If there's a search query, use search results instead
+        if self._search_query and len(self._search_query.strip()) >= 3:
+            self._render_search_results(preserve_position=preserve_position)
+            return
+        
+        # Reset page offset if not preserving position
+        if not preserve_position:
+            self._page_offset = 0
+        
+        # Try to get selected sources from tree, but fall back to _last_selected or database
+        try:
+            selected_values = list(self._get_selected_sources_from_tree())
+        except Exception:
+            # If tree is not ready, use _last_selected or load from database
+            if self._last_selected:
+                selected_values = list(self._last_selected)
+            else:
+                selected_values = list(get_selected_sources())
+                if not selected_values:
+                    selected_values = [0, 1, 2]  # Default selection
+        
+        selected_set = set(selected_values)
+        
+        # Only reload from database if selection actually changed
+        if selected_set != self._last_selected:
+            self._last_selected = selected_set
+            # Save selected sources to database
+            save_selected_sources(selected_values)
+            # Load entries from database (fetcher service handles fetching)
+            # Use cached entries if available, only load missing ones
+            if not hasattr(self, '_source_entries'):
+                self._source_entries = {}
+            # Only load entries for newly selected sources
+            missing_sources = [sid for sid in selected_values if sid not in self._source_entries]
+            if missing_sources:
+                new_entries = self._load_entries_from_db(missing_sources)
+                self._source_entries.update(new_entries)
+        elif not hasattr(self, '_source_entries') or not self._source_entries:
+            # If no cached entries, load them
+            self._source_entries = self._load_entries_from_db(selected_values)
+        
         # Collect and sort, filtering out read entries
         collected: List[tuple[str, RssEntry]] = []
         for sid in selected_values:
-            name, _ = self.SOURCES.get(sid, (str(sid), ""))
+            source_data = SOURCES.get(sid)
+            if not source_data:
+                continue
+            country, name, url = source_data
             for e in self._source_entries.get(sid, []):
                 entry_id = e.entry_id or f"{name}:{e.link or e.title}"
                 if entry_id not in self._read_entries:
                     collected.append((name, e))
         collected.sort(key=lambda ne: self._entry_dt(ne[1]), reverse=True)
-        self._render_entries_into_list(collected)
-        self.set_status(f"[green]Megjelenítve:[/] {len(collected)} bejegyzés {f'({len(selected_values)} forrás)' if selected_values else '(0 forrás)'}")
+        self._render_entries_into_list(collected, preserve_position=preserve_position)
+        self.set_status(f"[green]{self.t('displayed')}:[/] {len(collected)} {self.t('entries')} {f'({len(selected_values)} {self.t('sources')})' if selected_values else f'(0 {self.t('sources')})'}")
+    
+    def _render_search_results(self, preserve_position: bool = False) -> None:
+        """Render search results based on current search query"""
+        # Reset page offset if not preserving position
+        if not preserve_position:
+            self._page_offset = 0
+        
+        results = search_entries(self._search_query)
+        collected: List[tuple[str, RssEntry]] = []
+        
+        # Convert search results to RssEntry objects
+        for entry_id, source_id, source_name, title, link, published, summary in results:
+            # Filter out read entries
+            if entry_id not in self._read_entries:
+                entry = RssEntry(
+                    entry_id=entry_id,
+                    title=title,
+                    link=link,
+                    published=published,
+                    summary=summary
+                )
+                collected.append((source_name, entry))
+        
+        collected.sort(key=lambda ne: self._entry_dt(ne[1]), reverse=True)
+        self._render_entries_into_list(collected, preserve_position=preserve_position)
+        self.set_status(f"[green]{self.t('search')}:[/] {len(collected)} {self.t('results_for')} '{self._search_query}'")
 
     def _refresh_feeds(self) -> None:
-        """Refresh feeds and detect new entries"""
-        selection_list = cast(SelectionList[int], self.query_one("#sidebar SelectionList", SelectionList))
-        selected_values = list(selection_list.selected)
-        total_new = 0
+        """Refresh feeds by reloading from database (fetcher service handles fetching)"""
+        selected_values = list(self._get_selected_sources_from_tree())
         
-        for sid in selected_values:
-            new_count = self._ensure_source_loaded(sid, check_new=True)
-            total_new += new_count
+        # Trigger immediate fetch in background (non-blocking)
+        if self.fetcher_service:
+            self.fetcher_service.fetch_now()
         
-        # Re-render with highlighted new entries
+        # Reload entries from database
         if selected_values:
-            self._render_from_selection()
+            old_entry_ids = set()
+            for sid in selected_values:
+                for e in self._source_entries.get(sid, []):
+                    entry_id = e.entry_id or f"{SOURCES.get(sid, ('', '', ''))[1]}:{e.link or e.title}"
+                    old_entry_ids.add(entry_id)
+            
+            # Reload from database
+            self._source_entries = self._load_entries_from_db(selected_values)
+            
+            # Count new entries and add them to _new_entries set
+            new_entry_ids = set()
+            for sid in selected_values:
+                for e in self._source_entries.get(sid, []):
+                    entry_id = e.entry_id or f"{SOURCES.get(sid, ('', '', ''))[1]}:{e.link or e.title}"
+                    new_entry_ids.add(entry_id)
+            
+            # Find truly new entries (not in old set)
+            truly_new = new_entry_ids - old_entry_ids
+            # Add new entries to _new_entries set for visual indication
+            for entry_id in truly_new:
+                self._new_entries.add(entry_id)
+            
+            total_new = len(truly_new)
+            
+            # Only re-render if there are new entries
             if total_new > 0:
-                self.set_status(f"[bold green]◆[/bold green] [green]Frissítve:[/] {total_new} új cikk")
-            else:
-                self.set_status(f"[dim]Frissítve:[/] nincs új cikk")
+                # Save current index before re-rendering
+                list_view = self.query_one("#list", ListView)
+                current_idx = getattr(list_view, "index", None) or 0
+                
+                # Re-render with highlighted new entries, preserving cursor position
+                self._render_from_selection(preserve_position=True)
+                self.set_status(f"[bold green]*[/bold green] [green]{self.t('refreshed')}:[/] {total_new} {self.t('new_articles')}")
+                
+                # Set focus to list view after refresh and ensure cursor is visible
+                def set_focus_after_refresh():
+                    try:
+                        list_view = self.query_one("#list", ListView)
+                        if list_view:
+                            # Restore index to ensure cursor is visible
+                            if current_idx < len(list_view.children):
+                                list_view.index = current_idx
+                            list_view.focus()
+                    except Exception:
+                        pass
+                self.set_timer(0.1, set_focus_after_refresh)
+            # If no new entries, don't refresh the list, just update status silently
+            # (or don't update status at all to avoid unnecessary UI updates)
     
     def _load_initial_feeds(self) -> None:
-        # Load only initially selected sources and render
-        self.set_status("[yellow]Betöltés:[/] RSS csatornák lekérése...")
-        selection_list = cast(SelectionList[int], self.query_one("#sidebar SelectionList", SelectionList))
-        selected_values = list(selection_list.selected)
-        for sid in selected_values:
-            self._ensure_source_loaded(sid)
-        self._render_from_selection()
-
-    def on_selection_list_selected(self, event) -> None:
-        # Sidebar selection changed (checked) → ensure loaded and render filter
-        self._render_from_selection()
+        # Load only initially selected sources and render from database
+        # Try to get from tree first, but fall back to database if tree is not ready
         try:
-            selection_list = cast(SelectionList[int], self.query_one("#sidebar SelectionList", SelectionList))
-            sel = ", ".join(str(v) for v in selection_list.selected) or "(semmi)"
-            self.set_status(f"[dim]Event:[/] {type(event).__name__}  [dim]Kiválasztva:[/] {sel}")
+            selected_values = list(self._get_selected_sources_from_tree())
         except Exception:
-            self.set_status(f"[dim]Event:[/] {type(event).__name__}")
-        self.action_focus_content()
-
-    def on_selection_list_deselected(self, event) -> None:
-        # Sidebar selection changed (unchecked) → render filter
+            selected_values = []
+        
+        # If tree doesn't have selection yet, load from database
+        if not selected_values:
+            selected_values = list(get_selected_sources())
+            # If still no selection, use default (first 3 Hungarian sources)
+            if not selected_values:
+                selected_values = [0, 1, 2]
+                # Save default selection to database
+                save_selected_sources(set(selected_values))
+        
+        # Trigger initial fetch in background
+        if self.fetcher_service:
+            self.fetcher_service.fetch_now()
+        
+        # Load entries from database (fetcher service handles fetching)
+        if selected_values:
+            self.set_status(f"[yellow]{self.t('loading_channels')} ({len(selected_values)} {self.t('sources')})...")
+            self._source_entries = self._load_entries_from_db(selected_values)
+            total_entries = sum(len(entries) for entries in self._source_entries.values())
+            self.set_status(f"[green]{self.t('ready')}:[/] {total_entries} {self.t('entries')} {self.t('loaded')}")
+        else:
+            self.set_status(f"[dim]{self.t('no_channels_selected')}[/dim]")
+        
+        # Update _last_selected to match what we loaded
+        self._last_selected = set(selected_values)
+        # Render immediately - don't wait for timer
         self._render_from_selection()
-        try:
-            selection_list = cast(SelectionList[int], self.query_one("#sidebar SelectionList", SelectionList))
-            sel = ", ".join(str(v) for v in selection_list.selected) or "(semmi)"
-            self.set_status(f"[dim]Event:[/] {type(event).__name__}  [dim]Kiválasztva:[/] {sel}")
-        except Exception:
-            self.set_status(f"[dim]Event:[/] {type(event).__name__}")
-        self.action_focus_content()
+        # Set focus to list view after rendering
+        def set_focus_after_render():
+            try:
+                list_view = self.query_one("#list", ListView)
+                if list_view and hasattr(list_view, 'children') and len(list_view.children) > 0:
+                    list_view.focus()
+            except Exception:
+                pass
+        self.set_timer(0.1, set_focus_after_render)
 
-    # Some Textual versions emit a generic selection-changed message; handle it too
-    def on_selection_list_selection_changed(self, event) -> None:  # type: ignore[override]
-        self._render_from_selection()
-        try:
-            selection_list = cast(SelectionList[int], self.query_one("#sidebar SelectionList", SelectionList))
-            sel = ", ".join(str(v) for v in selection_list.selected) or "(semmi)"
-            self.set_status(f"[dim]Event:[/] {type(event).__name__}  [dim]Kiválasztva:[/] {sel}")
-        except Exception:
-            self.set_status(f"[dim]Event:[/] {type(event).__name__}")
+
 
     # Fallback: after any click in the sidebar area, re-render shortly after
     def on_click(self, event) -> None:

@@ -1,0 +1,14 @@
+Name,RSS URL
+ORF.at Nachrichten,https://orf.at/rss/
+Kronen Zeitung (Krone.at),https://api.krone.at/v1/rss/rssfeed-1
+Die Presse,https://diepresse.com/rss
+Kurier,https://kurier.at/rss
+Der Standard,https://derstandard.at/rss
+Salzburger Nachrichten,https://www.sn.at/xml/rss
+Oberösterreichische Nachrichten (OÖNachrichten),https://nachrichten.at/storage/rss/rss.xml
+Niederösterreichische Nachrichten (NÖN),https://www.noen.at/xml/rss
+OTS.at - Austria Presse Agentur,https://www.ots.at/rss/index
+Wiener Zeitung,https://wienerzeitung.at/_wzo/rss
+Vienna Online,https://www.vienna.at/feed
+Brutkasten - Startups/Business,https://brutkasten.com/feed
+Trend (Wirtschaft),https://trend.at/.content/rss/feed.xml

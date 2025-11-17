@@ -1,0 +1,9 @@
+Sorszám,Feed Neve,RSS Feed URL
+1,Kronen Zeitung RSS Feed,https://api.krone.at/v1/rss/rssfeed-google.xml?id=2311992
+2,Salzburger Nachrichten RSS Feed,https://www.sn.at/xml/rss
+3,OÖNachrichten RSS Feed,https://www.nachrichten.at/storage/rss/rss/nachrichten.xml
+4,NÖN RSS Feed,https://www.noen.at/xml/rss
+5,OTS RSS Feed,https://www.ots.at/rss/index
+6,Die Presse RSS Feed,https://www.diepresse.com/rss//
+7,Yeni Vatan Gazetesi RSS Feed,https://www.yenivatan.at/feed/
+8,Der Ennstaler RSS Feed,https://www.derennstaler.at/rss.xml
