@@ -74,6 +74,19 @@ Screen {
   border: none;
 }
 
+#list ListItem {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-wrap: nowrap;
+}
+
+#list ListItem Static {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-wrap: nowrap;
+  width: 100%;
+}
+
 #detail {
   height: 1fr;
   border: none;

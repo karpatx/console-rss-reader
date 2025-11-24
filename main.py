@@ -1,10 +1,12 @@
-from typing import cast, Dict, Tuple, List, DefaultDict, Iterable
+from typing import cast, Dict, Tuple, List, DefaultDict, Iterable, Optional
 from textual.app import App, ComposeResult
 from textual.screen import Screen, ModalScreen
 from textual.widgets import Static, SelectionList, ListView, ListItem, Button, Input, Tree, Select
+from textual.binding import Binding
 from textual.widgets.tree import TreeNode
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual import events
+from time import sleep
 
 from rss_reader import fetch_rss, RssEntry
 from rich.text import Text
@@ -82,10 +84,6 @@ class ArticleScreen(ModalScreen):
         self.language = language
     
     def compose(self) -> ComposeResult:
-        t = TRANSLATIONS.get(self.language, TRANSLATIONS["hu"])
-        self.BINDINGS = [
-            ("escape", "close", t["close"]),
-        ]
         # Parse markup strings into Text objects with error handling
         try:
             article_title_text = Text.from_markup(f"[bold]{escape(self.article_title)}[/bold]")
@@ -125,6 +123,15 @@ class ArticleScreen(ModalScreen):
     
     def action_close(self) -> None:
         self.dismiss()
+    
+    def on_key(self, event: events.Key) -> None:
+        """Handle key events - close on ESC"""
+        if event.key == "escape":
+            event.prevent_default()
+            self.action_close()
+        else:
+            # Let other keys be handled normally
+            pass
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "close-btn" or event.button.id == "close-x-btn":
@@ -422,33 +429,49 @@ class DockLayoutExample(App[None]):
         if self.focused != list_view:
             list_view.focus()
         
-        # Get current index in visible list
+        # Get current index in visible list BEFORE moving
         current_visible_idx = getattr(list_view, "index", 0) or 0
         visible_count = len(list_view.children)
         
-        # Check if we're at the bottom of visible page
+        self.log(f"action_cursor_down: current_idx={current_visible_idx}, visible_count={visible_count}, page_offset={self._page_offset}")
+        
+        # Check if we're at the bottom of visible page BEFORE moving
         if current_visible_idx >= visible_count - 1:
             # At bottom - check if we can page down
             if hasattr(self, "_entries") and self._entries:
                 total_entries = len(self._entries)
+                # Use visible_count to get the actual end of current visible page
+                # This ensures we don't skip any items
                 current_page_end = self._page_offset + visible_count
+                self.log(f"At bottom: current_page_end={current_page_end}, total_entries={total_entries}, visible_count={visible_count}")
                 if current_page_end < total_entries:
-                    # Move page down by one - show next page
-                    self._page_offset = self._page_offset + 1
-                    self.log(f"Cursor down at bottom: paging down, new offset={self._page_offset}")
-                    # Re-render with new page
-                    self._render_entries_into_list(self._entries, preserve_position=True)
-                    # Set cursor to first item of new page
-                    list_view = self.query_one("#list", ListView)
-                    if len(list_view.children) > 0:
-                        list_view.index = 0
+                    # Move to the next page - start from current_page_end (which is the end of current visible page)
+                    new_offset = current_page_end
+                    old_offset = self._page_offset
+                    self._page_offset = new_offset
+                    self.log(f"Paging down: old_offset={old_offset}, new_offset={self._page_offset}")
+                    # Re-render with new page - index will be set to 0 by _render_entries_into_list
+                    self._render_entries_into_list(self._entries, preserve_position=False)
+                    # Explicitly set index to 0 after render to ensure cursor is at top of new page
+                    def set_index_to_zero():
+                        try:
+                            list_view = self.query_one("#list", ListView)
+                            if len(list_view.children) > 0:
+                                list_view.index = 0
+                                self.log(f"Set index to 0 after paging down")
+                        except Exception as e:
+                            self.log(f"Error setting index to 0: {e}")
+                    self.call_after_refresh(set_index_to_zero)
                     self._update_detail_from_list()
                     return
                 else:
                     # Already at the end, don't move
                     self.log(f"Cursor down at bottom: already at end")
                     return
-        # Not at bottom, just move cursor down
+        
+        # Not at bottom, just move cursor down normally
+        # Call the ListView's action_cursor_down to move the cursor
+        self.log(f"Not at bottom, moving cursor down normally")
         list_view.action_cursor_down()
         self._update_detail_from_list()
 
@@ -459,30 +482,43 @@ class DockLayoutExample(App[None]):
         if self.focused != list_view:
             list_view.focus()
         
-        # Get current index in visible list
+        # Get current index in visible list BEFORE moving
         current_visible_idx = getattr(list_view, "index", 0) or 0
+        visible_count = len(list_view.children)
         
-        # Check if we're at the top of visible page
+        # Check if we're at the top of visible page BEFORE moving
         if current_visible_idx == 0:
             # At top - check if we can page up
             if self._page_offset > 0:
-                # Move page up by one - show previous page
-                self._page_offset = max(0, self._page_offset - 1)
+                current_page_size = getattr(self, "_page_size", visible_count)
+                # Move page up - go back by one page_size, but align to page boundaries
+                new_offset = max(0, self._page_offset - current_page_size)
+                # Make sure we don't go negative
+                if new_offset < 0:
+                    new_offset = 0
+                self._page_offset = new_offset
                 self.log(f"Cursor up at top: paging up, new offset={self._page_offset}")
-                # Re-render with new page
+                # Re-render with new page - index will be set to last item by _render_entries_into_list
                 if hasattr(self, "_entries") and self._entries:
-                    self._render_entries_into_list(self._entries, preserve_position=True)
-                    # Set cursor to last item of new page
-                    list_view = self.query_one("#list", ListView)
-                    if len(list_view.children) > 0:
-                        list_view.index = len(list_view.children) - 1
+                    self._render_entries_into_list(self._entries, preserve_position=False)
+                    # Set cursor to last item of new page after render
+                    def set_to_last_item():
+                        try:
+                            list_view = self.query_one("#list", ListView)
+                            if len(list_view.children) > 0:
+                                list_view.index = len(list_view.children) - 1
+                        except Exception:
+                            pass
+                    self.call_after_refresh(set_to_last_item)
                     self._update_detail_from_list()
                     return
             else:
                 # Already at the beginning, don't move
                 self.log(f"Cursor up at top: already at beginning")
                 return
-        # Not at top, just move cursor up
+        
+        # Not at top, just move cursor up normally
+        # Call the ListView's action_cursor_up to move the cursor
         list_view.action_cursor_up()
         self._update_detail_from_list()
     
@@ -491,31 +527,25 @@ class DockLayoutExample(App[None]):
         if not hasattr(self, "_entries") or not self._entries:
             return
         list_view = self.query_one("#list", ListView)
-        if self.focused != list_view:
+        was_focused = (self.focused == list_view)
+        if not was_focused:
             list_view.focus()
         
         # Move page up by page_size - replace all visible entries with previous page
         new_offset = max(0, self._page_offset - self._page_size)
         if new_offset != self._page_offset:
             self._page_offset = new_offset
-            # Render new page - don't preserve position, start from first item of new page
             self._render_entries_into_list(self._entries, preserve_position=False)
-            # Set cursor to first item of new page
-            if len(list_view.children) > 0:
-                list_view.index = 0
         self._update_detail_from_list()
     
     def action_page_down(self) -> None:
         """Move page down - replace all visible entries with next page"""
-        self.log(f"=== Page Down action called! ===")
-        self.log(f"Current offset: {getattr(self, '_page_offset', 0)}")
-        
         if not hasattr(self, "_entries") or not self._entries:
-            self.log("No entries available")
             return
         
         list_view = self.query_one("#list", ListView)
-        if self.focused != list_view:
+        was_focused = (self.focused == list_view)
+        if not was_focused:
             list_view.focus()
         
         # Get current page_size
@@ -523,29 +553,14 @@ class DockLayoutExample(App[None]):
         current_offset = getattr(self, "_page_offset", 0)
         total_entries = len(self._entries)
         
-        self.log(f"Offset: {current_offset}, Page size: {current_page_size}, Total entries: {total_entries}")
-        
         # Calculate new offset - move forward by one page
         new_offset = current_offset + current_page_size
-        
-        self.log(f"New offset would be: {new_offset}")
         
         # Only move if there are more entries to show
         if new_offset <= total_entries:
             # Update offset
-            old_offset = self._page_offset
             self._page_offset = new_offset
-            self.log(f"Offset changed: {old_offset} -> {self._page_offset}")
-            # Force render with new page - this will replace all visible entries
             self._render_entries_into_list(self._entries, preserve_position=False)
-            # Set cursor to first item of new page
-            list_view = self.query_one("#list", ListView)
-            visible_count = len(list_view.children)
-            self.log(f"After render: visible items: {visible_count}")
-            if visible_count > 0:
-                list_view.index = 0
-        else:
-            self.log(f"Cannot move: new_offset {new_offset} > total {total_entries}")
         self._update_detail_from_list()
 
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
@@ -683,18 +698,32 @@ class DockLayoutExample(App[None]):
         self._update_detail_from_list()
     
     def on_key(self, event: events.Key) -> None:
-        """Handle key events - intercept Page Down/Up before ListView can handle them"""
-        # Only intercept Page Down/Up when ListView is focused
-        # Let all other keys pass through normally
-        if event.key in ("pagedown", "pageup"):
-            if self.focused and hasattr(self.focused, 'id') and self.focused.id == "list":
+        """Handle key events - intercept Page Down/Up and j/k before ListView can handle them"""
+        # Only intercept when ListView is focused
+        if self.focused and hasattr(self.focused, 'id') and self.focused.id == "list":
+            if event.key == "pagedown":
                 event.prevent_default()
-                if event.key == "pagedown":
-                    self.log("=== Page Down key intercepted! ===")
-                    self.action_page_down()
-                elif event.key == "pageup":
-                    self.log("=== Page Up key intercepted! ===")
-                    self.action_page_up()
+                event.stop()
+                self.log("=== Page Down key intercepted! ===")
+                self.action_page_down()
+                return
+            elif event.key == "pageup":
+                event.prevent_default()
+                event.stop()
+                self.log("=== Page Up key intercepted! ===")
+                self.action_page_up()
+                return
+            elif event.key == "j" or event.key == "down":
+                # Intercept j/down to handle pagination at bottom
+                event.prevent_default()
+                event.stop()
+                self.action_cursor_down()
+                return
+            elif event.key == "k" or event.key == "up":
+                # Intercept k/up to handle pagination at top
+                event.prevent_default()
+                event.stop()
+                self.action_cursor_up()
                 return
         # For all other keys, don't do anything - let them be handled normally
 
@@ -938,11 +967,11 @@ class DockLayoutExample(App[None]):
             new_entry_ids = {e.entry_id or f"{name}:{e.link or e.title}" for name, e in entries}
             entries_changed = (old_entry_ids != new_entry_ids)
         
-        # Save current cursor position and focus state if we want to preserve it
+        # Save current cursor position if we want to preserve it
         current_entry_id = None
         current_absolute_index = None  # Index in full entries list
         current_visible_index = None  # Index in visible page
-        was_focused = False
+        
         
         # Only skip rendering if entries didn't change AND page didn't change AND preserving position
         if preserve_position and hasattr(self, "_entries") and self._entries and not entries_changed and not page_changed:
@@ -968,8 +997,6 @@ class DockLayoutExample(App[None]):
                 if 0 <= current_absolute_index < len(self._entries):
                     _, current_entry = self._entries[current_absolute_index]
                     current_entry_id = current_entry.entry_id or f"{self._entries[current_absolute_index][0]}:{current_entry.link or current_entry.title}"
-            # Check if list_view was focused before clearing
-            was_focused = (hasattr(self, 'focused') and self.focused == list_view)
         
         # Get visible entries slice (only render what's visible)
         # If offset is beyond entries, show empty list (that's fine, it means we've reached the end)
@@ -988,6 +1015,9 @@ class DockLayoutExample(App[None]):
         # (page changes always require rebuild, even with preserve_position)
         if entries_changed or page_changed or not preserve_position:
             self.log(f"Clearing list and rebuilding...")
+            # Save current index before clearing
+            current_index = getattr(list_view, "index", None) if hasattr(list_view, "index") else None
+            
             list_view.clear()
             # Check if we're in search mode
             is_search_mode = hasattr(self, "_search_query") and self._search_query and len(self._search_query.strip()) >= 3
@@ -999,6 +1029,8 @@ class DockLayoutExample(App[None]):
                 absolute_idx = self._page_offset + idx
                 
                 title = entry.title or f"({self.t('no_title')})"
+                # Don't truncate - let the widget handle overflow
+                # title = self._truncate_title(title)
                 # Get date in YYYY-MM-DD HH:MM format
                 date_str = self._format_entry_date(entry)
                 entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
@@ -1040,52 +1072,42 @@ class DockLayoutExample(App[None]):
             # Batch append all items at once (faster than one-by-one)
             for item in items_to_add:
                 list_view.append(item)
-        
-        # Restore cursor position if we preserved it
-        if preserve_position and current_entry_id is not None:
-            # Find the entry in the visible entries
-            restored_visible_index = None
-            for idx, (name, entry) in enumerate(visible_entries):
-                entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
-                if entry_id == current_entry_id:
-                    restored_visible_index = idx
-                    break
-            if restored_visible_index is not None:
-                list_view.index = restored_visible_index
-            elif current_visible_index is not None and current_visible_index < len(visible_entries):
-                list_view.index = current_visible_index
-            elif visible_entries:
-                list_view.index = 0
-            # If no visible entries (reached end), don't set index
-        elif visible_entries and entries_changed:
-            # If not preserving position, move to first item
-            list_view.index = 0
-        elif not visible_entries:
-            # If no visible entries (reached end), clear the index
-            list_view.index = 0
-        
-        # Restore focus and cursor visibility if it was focused before or we're preserving position
-        if (preserve_position or was_focused) and entries_changed:
-            # Use set_timer to restore focus after rendering
-            def restore_focus():
+            
+            # Set index after render is complete to ensure cursor appears
+            def set_index_after_render():
                 try:
-                    list_view.focus()
-                    # Ensure cursor is visible by setting index again
+                    list_view = self.query_one("#list", ListView)
+                    if not visible_entries or len(list_view.children) == 0:
+                        return
+                    
                     if preserve_position and current_entry_id is not None:
+                        # Find the entry in the visible entries
+                        restored_visible_index = None
                         for idx, (name, entry) in enumerate(visible_entries):
                             entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
                             if entry_id == current_entry_id:
-                                list_view.index = idx
+                                restored_visible_index = idx
                                 break
-                    elif current_visible_index is not None and current_visible_index < len(visible_entries):
-                        list_view.index = current_visible_index
+                        if restored_visible_index is not None and restored_visible_index < len(list_view.children):
+                            list_view.index = restored_visible_index
+                        elif current_visible_index is not None and current_visible_index < len(list_view.children):
+                            list_view.index = current_visible_index
+                        elif len(list_view.children) > 0:
+                            list_view.index = 0
+                    elif len(list_view.children) > 0:
+                        list_view.index = 0
                 except Exception:
                     pass
-            self.set_timer(0.01, restore_focus)
+            
+            # Use call_after_refresh to ensure render is complete before setting index
+            self.call_after_refresh(set_index_after_render)
+
+        
         
         self._entries = entries
         self._last_page_offset = self._page_offset  # Save current page offset
         self._update_detail_from_list()
+
 
     def _entry_dt(self, e: RssEntry) -> datetime:
         """Parse published date from RSS entry. Returns datetime for sorting (normalized to UTC)."""
@@ -1134,6 +1156,34 @@ class DockLayoutExample(App[None]):
         dt = self._entry_dt(e)
         return dt.strftime("%Y-%m-%d %H:%M")
     
+    def _truncate_title(self, title: str, max_length: Optional[int] = None) -> str:
+        """Truncate title to max_length characters, adding '...' if truncated.
+        If max_length is None, calculates based on ListView width."""
+        if max_length is None:
+            # Calculate max_length based on ListView width
+            try:
+                list_view = self.query_one("#list", ListView)
+                # Get available width
+                available_width = 100  # Default fallback
+                if hasattr(list_view, 'content_size') and hasattr(list_view.content_size, 'width'):
+                    if list_view.content_size.width > 0:
+                        available_width = list_view.content_size.width
+                elif hasattr(list_view, 'size') and hasattr(list_view.size, 'width'):
+                    if list_view.size.width > 0:
+                        available_width = list_view.size.width
+                
+                # Reserve space for other elements (more conservative estimate)
+                # Entry number: ~8 chars, indicators: ~3 chars, date: ~16 chars, name: ~15 chars, separator: ~2 chars, padding: ~2 chars
+                reserved_space = 30
+                max_length = max(40, available_width - reserved_space)
+            except Exception:
+                # If we can't get the ListView, use a safe default
+                max_length = 80  # Default fallback
+        
+        if len(title) <= max_length:
+            return title
+        return title[:max_length - 3] + "..."
+    
     def _update_list_item_at_index(self, visible_index: int) -> None:
         """Update a single list item at the given visible index to reflect current state"""
         if not hasattr(self, "_entries") or not self._entries:
@@ -1150,6 +1200,8 @@ class DockLayoutExample(App[None]):
         
         name, entry = self._entries[absolute_index]
         title = entry.title or "(cím nélkül)"
+        # Don't truncate - let the widget handle overflow
+        # title = self._truncate_title(title)
         date_str = self._format_entry_date(entry)
         entry_id = entry.entry_id or f"{name}:{entry.link or entry.title}"
         
@@ -1649,16 +1701,8 @@ class DockLayoutExample(App[None]):
         # Update _last_selected to match what we loaded
         self._last_selected = set(selected_values)
         # Render immediately - don't wait for timer
+        # Focus restoration is handled by _render_from_selection
         self._render_from_selection()
-        # Set focus to list view after rendering
-        def set_focus_after_render():
-            try:
-                list_view = self.query_one("#list", ListView)
-                if list_view and hasattr(list_view, 'children') and len(list_view.children) > 0:
-                    list_view.focus()
-            except Exception:
-                pass
-        self.set_timer(0.1, set_focus_after_render)
 
 
 
