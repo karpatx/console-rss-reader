@@ -924,7 +924,11 @@ class DockLayoutExample(App[None]):
         footer.update(Text.from_markup(message))
 
     def _render_entries_into_list(self, entries: List[tuple[str, RssEntry]], preserve_position: bool = False) -> None:
-        list_view = self.query_one("#list", ListView)
+        try:
+            list_view = self.query_one("#list", ListView)
+        except Exception as e:
+            self.log(f"Error getting list view: {e}")
+            return
         
         # Calculate page size based on ListView height - exactly match visible height
         try:
@@ -974,7 +978,9 @@ class DockLayoutExample(App[None]):
         
         
         # Only skip rendering if entries didn't change AND page didn't change AND preserving position
-        if preserve_position and hasattr(self, "_entries") and self._entries and not entries_changed and not page_changed:
+        # BUT: always render if list is empty (no children) to ensure placeholder is shown
+        list_has_children = len(list_view.children) > 0
+        if preserve_position and hasattr(self, "_entries") and self._entries and not entries_changed and not page_changed and list_has_children:
             # If entries didn't change and page didn't change, just update indicators and return early
             current_visible_index = getattr(list_view, "index", None)
             if current_visible_index is not None and 0 <= current_visible_index < len(list_view.children):
@@ -1013,12 +1019,20 @@ class DockLayoutExample(App[None]):
         
         # Always clear and rebuild when page changes or entries change
         # (page changes always require rebuild, even with preserve_position)
-        if entries_changed or page_changed or not preserve_position:
-            self.log(f"Clearing list and rebuilding...")
+        # Also rebuild if list is empty (to show placeholder)
+        # FORCE rebuild on first render (when _entries doesn't exist or is empty)
+        is_first_render = not hasattr(self, "_entries") or not self._entries or len(self._entries) == 0
+        should_rebuild = entries_changed or page_changed or not preserve_position or len(list_view.children) == 0 or is_first_render
+        if should_rebuild:
+            self.log(f"Clearing list and rebuilding... (entries_changed={entries_changed}, page_changed={page_changed}, preserve={preserve_position}, children={len(list_view.children)})")
             # Save current index before clearing
             current_index = getattr(list_view, "index", None) if hasattr(list_view, "index") else None
             
-            list_view.clear()
+            try:
+                list_view.clear()
+            except Exception as e:
+                self.log(f"Error clearing list view: {e}")
+                return
             # Check if we're in search mode
             is_search_mode = hasattr(self, "_search_query") and self._search_query and len(self._search_query.strip()) >= 3
             
@@ -1073,10 +1087,28 @@ class DockLayoutExample(App[None]):
             for item in items_to_add:
                 list_view.append(item)
             
+            # If no entries, show a placeholder message
+            if not items_to_add:
+                placeholder_text = self.t("no_entries") if hasattr(self, 't') else "Nincsenek bejegyzések"
+                try:
+                    placeholder_item = ListItem(Static(Text.from_markup(f"[dim]{placeholder_text}[/dim]")))
+                    list_view.append(placeholder_item)
+                except Exception:
+                    pass
+            
             # Set index after render is complete to ensure cursor appears
             def set_index_after_render():
                 try:
                     list_view = self.query_one("#list", ListView)
+                    # If list is still empty after rendering, ensure placeholder is shown
+                    if len(list_view.children) == 0 and not entries:
+                        placeholder_text = self.t("no_entries") if hasattr(self, 't') else "Nincsenek bejegyzések"
+                        try:
+                            placeholder_item = ListItem(Static(Text.from_markup(f"[dim]{placeholder_text}[/dim]")))
+                            list_view.append(placeholder_item)
+                            self.log(f"Added placeholder message to empty list")
+                        except Exception as e:
+                            self.log(f"Error adding placeholder: {e}")
                     if not visible_entries or len(list_view.children) == 0:
                         return
                     
@@ -1096,8 +1128,12 @@ class DockLayoutExample(App[None]):
                             list_view.index = 0
                     elif len(list_view.children) > 0:
                         list_view.index = 0
-                except Exception:
-                    pass
+                    # Always set focus to list view after render
+                    list_view.focus()
+                    # Update detail view
+                    self._update_detail_from_list()
+                except Exception as e:
+                    self.log(f"Error in set_index_after_render: {e}")
             
             # Use call_after_refresh to ensure render is complete before setting index
             self.call_after_refresh(set_index_after_render)
@@ -1361,6 +1397,10 @@ class DockLayoutExample(App[None]):
         # Track new entries
         self._new_entries = set()
         
+        # Initialize _entries to empty list to ensure it exists
+        if not hasattr(self, "_entries"):
+            self._entries = []
+        
         # Index all unindexed entries on startup
         self.set_status(f"[yellow]{self.t('indexing_unindexed')}[/]")
         indexed_count = index_all_unindexed_entries()
@@ -1404,6 +1444,92 @@ class DockLayoutExample(App[None]):
         self.set_interval(0.2, self._poll_sidebar_selection)
         # Refresh feeds every 30 seconds (reload from database, fetcher service handles fetching)
         self.set_interval(30.0, self._refresh_feeds)
+        
+        # Force initial render after a delay to ensure everything is ready
+        # Use a flag to prevent multiple renders
+        if not hasattr(self, '_initial_render_done'):
+            self._initial_render_done = False
+        
+        def force_initial_render():
+            # Only render once
+            if self._initial_render_done:
+                return
+            
+            try:
+                self.log("Force initial render called")
+                # Ensure _last_selected is set
+                if not self._last_selected:
+                    selected = get_selected_sources()
+                    if not selected:
+                        selected = {0, 1, 2}
+                    self._last_selected = selected
+                    save_selected_sources(self._last_selected)
+                
+                # Ensure _source_entries is loaded
+                if not hasattr(self, '_source_entries') or not self._source_entries:
+                    self._source_entries = self._load_entries_from_db(list(self._last_selected))
+                
+                # Collect entries directly (don't rely on tree)
+                collected: List[tuple[str, RssEntry]] = []
+                for sid in self._last_selected:
+                    source_data = SOURCES.get(sid)
+                    if not source_data:
+                        continue
+                    country, name, url = source_data
+                    for e in self._source_entries.get(sid, []):
+                        entry_id = e.entry_id or f"{name}:{e.link or e.title}"
+                        if entry_id not in self._read_entries:
+                            collected.append((name, e))
+                collected.sort(key=lambda ne: self._entry_dt(ne[1]), reverse=True)
+                
+                # Render directly
+                self._render_entries_into_list(collected, preserve_position=False)
+                self.log(f"Force initial render completed, entries: {len(collected)}")
+                self.set_status(f"[green]{self.t('displayed')}:[/] {len(collected)} {self.t('entries')} {f'({len(self._last_selected)} {self.t('sources')})' if self._last_selected else f'(0 {self.t('sources')})'}")
+                
+                # Set focus and index after render
+                def set_focus_and_index():
+                    try:
+                        list_view = self.query_one("#list", ListView)
+                        if list_view:
+                            # Set index to first item if available
+                            if len(list_view.children) > 0:
+                                list_view.index = 0
+                                self.log("Set index to 0")
+                            # Set focus to list view
+                            list_view.focus()
+                            self.log("Set focus to list view")
+                            # Update detail view
+                            self._update_detail_from_list()
+                        else:
+                            self.log("List view not found in set_focus_and_index")
+                    except Exception as e:
+                        self.log(f"Error setting focus and index: {e}")
+                
+                self.call_after_refresh(set_focus_and_index)
+                
+                # Mark as done
+                self._initial_render_done = True
+                
+                # Double check: if list is still empty, render empty list with placeholder
+                def check_list():
+                    try:
+                        list_view = self.query_one("#list", ListView)
+                        if list_view and len(list_view.children) == 0:
+                            self.log("List still empty after force render, showing placeholder")
+                            self._render_entries_into_list([], preserve_position=False)
+                            # Set focus even for empty list
+                            list_view.focus()
+                    except Exception:
+                        pass
+                self.call_after_refresh(check_list)
+            except Exception as e:
+                self.log(f"Error in force_initial_render: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+        
+        # Try once after a short delay to ensure UI is ready
+        self.set_timer(0.5, force_initial_render)
 
     def _get_selected_sources_from_tree(self) -> set[int]:
         """Get currently selected sources from the tree widget"""
@@ -1537,13 +1663,20 @@ class DockLayoutExample(App[None]):
             self._page_offset = 0
         
         # Try to get selected sources from tree, but fall back to _last_selected or database
-        try:
-            selected_values = list(self._get_selected_sources_from_tree())
-        except Exception:
-            # If tree is not ready, use _last_selected or load from database
-            if self._last_selected:
-                selected_values = list(self._last_selected)
-            else:
+        # IMPORTANT: On initial load, tree might not be ready, so always check _last_selected first
+        selected_values = None
+        if self._last_selected:
+            # Use _last_selected if available (set during _load_initial_feeds)
+            selected_values = list(self._last_selected)
+        else:
+            # Try tree, but don't fail if it's not ready
+            try:
+                selected_values = list(self._get_selected_sources_from_tree())
+            except Exception:
+                pass
+            
+            # If still no selection, load from database or use default
+            if not selected_values:
                 selected_values = list(get_selected_sources())
                 if not selected_values:
                     selected_values = [0, 1, 2]  # Default selection
@@ -1694,15 +1827,17 @@ class DockLayoutExample(App[None]):
             self.set_status(f"[yellow]{self.t('loading_channels')} ({len(selected_values)} {self.t('sources')})...")
             self._source_entries = self._load_entries_from_db(selected_values)
             total_entries = sum(len(entries) for entries in self._source_entries.values())
-            self.set_status(f"[green]{self.t('ready')}:[/] {total_entries} {self.t('entries')} {self.t('loaded')}")
+            self.set_status(f"[green]{self.t('ready')}:[/] {total_entries} {self.t('entries')}")
         else:
             self.set_status(f"[dim]{self.t('no_channels_selected')}[/dim]")
         
         # Update _last_selected to match what we loaded
         self._last_selected = set(selected_values)
-        # Render immediately - don't wait for timer
-        # Focus restoration is handled by _render_from_selection
-        self._render_from_selection()
+        # Save selected sources to ensure they're available for rendering
+        save_selected_sources(self._last_selected)
+        
+        # Note: Actual rendering will be done in on_mount's force_initial_render
+        # This ensures the UI is fully ready before rendering
 
 
 

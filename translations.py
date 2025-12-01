@@ -47,6 +47,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "rss_sources": "RSS Sources",
         "language": "Language",
         "no_title": "no title",
+        "no_entries": "No entries available",
         # Country names
         "country_hu": "Hungary",
         "country_de": "Germany",
@@ -111,6 +112,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "rss_sources": "RSS Források",
         "language": "Nyelv",
         "no_title": "cím nélkül",
+        "no_entries": "Nincsenek bejegyzések",
         # Country names
         "country_hu": "Magyarország",
         "country_de": "Németország",
@@ -175,6 +177,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "rss_sources": "Sources RSS",
         "language": "Langue",
         "no_title": "sans titre",
+        "no_entries": "Aucune entrée disponible",
         # Country names
         "country_hu": "Hongrie",
         "country_de": "Allemagne",
@@ -239,6 +242,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "rss_sources": "Fonti RSS",
         "language": "Lingua",
         "no_title": "senza titolo",
+        "no_entries": "Nessuna voce disponibile",
         # Country names
         "country_hu": "Ungheria",
         "country_de": "Germania",
@@ -303,6 +307,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "rss_sources": "Fuentes RSS",
         "language": "Idioma",
         "no_title": "sin título",
+        "no_entries": "No hay entradas disponibles",
         # Country names
         "country_hu": "Hungría",
         "country_de": "Alemania",
@@ -367,6 +372,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "rss_sources": "Fontes RSS",
         "language": "Idioma",
         "no_title": "sem título",
+        "no_entries": "Nenhuma entrada disponível",
         # Country names
         "country_hu": "Hungria",
         "country_de": "Alemanha",
@@ -431,6 +437,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "rss_sources": "RSS-Quellen",
         "language": "Sprache",
         "no_title": "ohne Titel",
+        "no_entries": "Keine Einträge verfügbar",
         # Country names
         "country_hu": "Ungarn",
         "country_de": "Deutschland",

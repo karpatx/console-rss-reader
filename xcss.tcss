@@ -71,7 +71,7 @@ Screen {
   height: 1fr;
   overflow: hidden;
   padding: 0 1;
-  border: none;
+  border: solid $accent;
 }
 
 #list ListItem {
